@@ -10,6 +10,69 @@ header()  { echo -e "\n\033[1;36m=== $1 ===\033[0m\n"; }
 # ===== ПУТЬ К ФАЙЛУ НАСТРОЕК =====
 CONFIG_FILE="/root/.bedolaga-config"
 
+# ===== ФУНКЦИЯ: Авто-детект доменов из конфигов =====
+detect_domains() {
+  info "🔍 Авто-детект доменов из конфигов..."
+  
+  local BOT_ENV="/opt/remnawave-bedolaga-telegram-bot/.env"
+  local CABINET_ENV="/opt/bedolaga-cabinet/.env"
+  local CADDYFILE="/opt/caddy/Caddyfile"
+  
+  # Пытаемся найти домены в разных местах
+  local DETECTED_DOMAINS=()
+  
+  # Ищем в .env бота (WEBHOOK_HOST, API_URL, etc.)
+  if [ -f "$BOT_ENV" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^[A-Z_]+=(https?://)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
+        local domain="${BASH_REMATCH[2]}"
+        if [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]] && [[ ! "$domain" =~ localhost|127\.0\.0\.1 ]]; then
+          DETECTED_DOMAINS+=("$domain")
+        fi
+      fi
+    done < <(grep -E "^(WEBHOOK|API|APP|BOT)_URL|DOMAIN|HOST=" "$BOT_ENV" 2>/dev/null || true)
+  fi
+  
+  # Ищем в Caddyfile
+  if [ -f "$CADDYFILE" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
+        local domain="${BASH_REMATCH[1]}"
+        if [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]]; then
+          DETECTED_DOMAINS+=("$domain")
+        fi
+      fi
+    done < <(grep -E "^https?://" "$CADDYFILE" 2>/dev/null || true)
+  fi
+  
+  # Если нашли — показываем и спрашиваем
+  if [ ${#DETECTED_DOMAINS[@]} -gt 0 ]; then
+    echo ""
+    info "Найдены домены в конфигах:"
+    for i in "${!DETECTED_DOMAINS[@]}"; do
+      echo "  $((i+1))) ${DETECTED_DOMAINS[$i]}"
+    done
+    echo ""
+    read -p "✅ Использовать найденные домены для проверок? [Y/n]: " CONFIRM_DOMAINS
+    if [[ ! "$CONFIRM_DOMAINS" =~ ^[Nn]$ ]]; then
+      # Используем первый домен для основных проверок
+      PRIMARY_DOMAIN="${DETECTED_DOMAINS[0]}"
+      success "Используем домен: $PRIMARY_DOMAIN"
+      return 0
+    fi
+  fi
+  
+  # Если не нашли или пользователь отказался — спрашиваем вручную
+  echo ""
+  info "Не удалось авто-определить домены или вы отказались."
+  read -p "🌐 Введите основной домен для проверок (например, app.yoursite.st): " PRIMARY_DOMAIN
+  if [ -z "$PRIMARY_DOMAIN" ]; then
+    error "Домен обязателен для проверок!"
+    return 1
+  fi
+  success "Используем домен: $PRIMARY_DOMAIN"
+}
+
 # ===== ЗАГРУЗКА ИЛИ СОЗДАНИЕ КОНФИГА =====
 if [ -f "$CONFIG_FILE" ]; then
   source "$CONFIG_FILE"
@@ -146,6 +209,9 @@ info "Резервный сервер: $BACKUP_USER@$BACKUP_SERVER:$BACKUP_REMOT
 info "Локальных бэкапов хранится: $BACKUP_RETENTION"
 echo ""
 
+# ===== АВТО-ДЕТЕКТ ДОМЕНОВ =====
+detect_domains || { error "Не удалось определить домен — проверки могут не работать"; }
+
 # ===== МЕНЮ =====
 echo "Выберите действие:"
 echo "1) 🔒 Только бэкап"
@@ -274,22 +340,43 @@ do_check() {
     success "Все контейнеры: healthy 🟢"
   fi
 
-  # Кабинет
-  if curl -s -o /dev/null -w "%{http_code}" https://app.whiterabbit.st | grep -q "200"; then
-    success "Кабинет: HTTP 200 🟢"
+  # Кабинет (используем авто-детект домена)
+  if [ -n "$PRIMARY_DOMAIN" ]; then
+    info "Проверка кабинета: $PRIMARY_DOMAIN..."
+    if curl -s -o /dev/null -w "%{http_code}" "https://$PRIMARY_DOMAIN" | grep -q "200"; then
+      success "Кабинет ($PRIMARY_DOMAIN): HTTP 200 🟢"
+    else
+      error "Кабинет ($PRIMARY_DOMAIN): не отвечает ❌"
+      STATUS=1
+    fi
   else
-    error "Кабинет: не отвечает ❌"
-    STATUS=1
+    info "Домен не определён — пропускаем проверку кабинета"
   fi
 
-  # API endpoint
+  # API endpoint (проверяем через hooks или api поддомен, если найден)
   info "Проверка API endpoint..."
-  API_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 https://hooks.whiterabbit.st/)
-  if [[ "$API_CODE" =~ ^(200|404|405|401|403)$ ]]; then
-    success "API endpoint доступен (код: $API_CODE) 🟢"
+  # Пытаемся угадать API домен
+  local API_DOMAIN=""
+  if [[ "$PRIMARY_DOMAIN" =~ ^app\. ]]; then
+    API_DOMAIN="${PRIMARY_DOMAIN/app./api.}"
+  elif [[ "$PRIMARY_DOMAIN" =~ ^hooks\. ]]; then
+    API_DOMAIN="$PRIMARY_DOMAIN"
   else
-    error "API endpoint не отвечает (код: $API_CODE) ❌"
-    STATUS=1
+    API_DOMAIN="api.$PRIMARY_DOMAIN"
+  fi
+  
+  API_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://$API_DOMAIN" 2>/dev/null || echo "000")
+  if [[ "$API_CODE" =~ ^(200|404|405|401|403)$ ]]; then
+    success "API endpoint ($API_DOMAIN) доступен (код: $API_CODE) 🟢"
+  else
+    # Пробуем fallback на hooks
+    FALLBACK_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://hooks.$(echo $PRIMARY_DOMAIN | sed 's/^[^.]*\.//')" 2>/dev/null || echo "000")
+    if [[ "$FALLBACK_CODE" =~ ^(200|404|405|401|403)$ ]]; then
+      success "API endpoint (fallback) доступен (код: $FALLBACK_CODE) 🟢"
+    else
+      error "API endpoint не отвечает (код: $API_CODE) ❌"
+      STATUS=1
+    fi
   fi
 
   return $STATUS
