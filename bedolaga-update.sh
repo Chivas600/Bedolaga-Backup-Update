@@ -15,37 +15,35 @@ detect_domains() {
   info "🔍 Авто-детект доменов из конфигов..."
   
   local BOT_ENV="/opt/remnawave-bedolaga-telegram-bot/.env"
-  local CABINET_ENV="/opt/bedolaga-cabinet/.env"
   local CADDYFILE="/opt/caddy/Caddyfile"
   
-  # Пытаемся найти домены в разных местах
   local DETECTED_DOMAINS=()
-  
-  # Ищем в .env бота (WEBHOOK_HOST, API_URL, etc.)
-  if [ -f "$BOT_ENV" ]; then
-    while IFS= read -r line; do
-      if [[ "$line" =~ ^[A-Z_]+=(https?://)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
-        local domain="${BASH_REMATCH[2]}"
-        if [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]] && [[ ! "$domain" =~ localhost|127\.0\.0\.1 ]]; then
-          DETECTED_DOMAINS+=("$domain")
-        fi
-      fi
-    done < <(grep -E "^(WEBHOOK|API|APP|BOT)_URL|DOMAIN|HOST=" "$BOT_ENV" 2>/dev/null || true)
-  fi
   
   # Ищем в Caddyfile
   if [ -f "$CADDYFILE" ]; then
     while IFS= read -r line; do
       if [[ "$line" =~ ^https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
         local domain="${BASH_REMATCH[1]}"
-        if [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]]; then
+        if [[ ! "$domain" =~ localhost|127\.0\.0\.1 ]] && [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]]; then
           DETECTED_DOMAINS+=("$domain")
         fi
       fi
     done < <(grep -E "^https?://" "$CADDYFILE" 2>/dev/null || true)
   fi
   
-  # Если нашли — показываем и спрашиваем
+  # Ищем в .env бота
+  if [ -f "$BOT_ENV" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ =(https?://)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
+        local domain="${BASH_REMATCH[2]}"
+        if [[ ! "$domain" =~ localhost|127\.0\.0\.1 ]] && [[ ! " ${DETECTED_DOMAINS[@]} " =~ " ${domain} " ]]; then
+          DETECTED_DOMAINS+=("$domain")
+        fi
+      fi
+    done < <(grep -E "^(WEBHOOK|API|APP|BOT)_URL|DOMAIN|HOST=" "$BOT_ENV" 2>/dev/null || true)
+  fi
+  
+  # Если нашли домены — показываем и даём выбрать
   if [ ${#DETECTED_DOMAINS[@]} -gt 0 ]; then
     echo ""
     info "Найдены домены в конфигах:"
@@ -53,24 +51,43 @@ detect_domains() {
       echo "  $((i+1))) ${DETECTED_DOMAINS[$i]}"
     done
     echo ""
-    read -p "✅ Использовать найденные домены для проверок? [Y/n]: " CONFIRM_DOMAINS
-    if [[ ! "$CONFIRM_DOMAINS" =~ ^[Nn]$ ]]; then
-      # Используем первый домен для основных проверок
-      PRIMARY_DOMAIN="${DETECTED_DOMAINS[0]}"
-      success "Используем домен: $PRIMARY_DOMAIN"
-      return 0
+    
+    # Спрашиваем какой домен для кабинета
+    read -p "📌 Введите номер домена для ПРОВЕРКИ КАБИНЕТА [1]: " CABINET_NUM
+    CABINET_NUM=${CABINET_NUM:-1}
+    PRIMARY_DOMAIN="${DETECTED_DOMAINS[$((CABINET_NUM-1))]}"
+    success "Кабинет: $PRIMARY_DOMAIN"
+    
+    # Спрашиваем какой домен для API (если больше 1 домена)
+    if [ ${#DETECTED_DOMAINS[@]} -gt 1 ]; then
+      echo ""
+      read -p "📌 Введите номер домена для ПРОВЕРКИ API [$((CABINET_NUM % ${#DETECTED_DOMAINS[@]} + 1))]: " API_NUM
+      if [ -z "$API_NUM" ]; then
+        # Если не ввели — берём следующий после кабинета (по кругу)
+        API_NUM=$((CABINET_NUM % ${#DETECTED_DOMAINS[@]} + 1))
+      fi
+      HOOKS_DOMAIN="${DETECTED_DOMAINS[$((API_NUM-1))]}"
+      success "API: $HOOKS_DOMAIN"
+    else
+      # Если один домен — используем его для обоих проверок
+      HOOKS_DOMAIN="$PRIMARY_DOMAIN"
+      info "API: используем тот же домен ($HOOKS_DOMAIN)"
     fi
+  else
+    # Если не нашли — спрашиваем вручную
+    echo ""
+    info "Не удалось авто-определить домены."
+    read -p "🌐 Введите домен кабинета: " PRIMARY_DOMAIN
+    if [ -z "$PRIMARY_DOMAIN" ]; then
+      error "Домен кабинета обязателен!"
+      return 1
+    fi
+    read -p "🌐 Введите домен API (или Enter для того же): " HOOKS_DOMAIN
+    HOOKS_DOMAIN=${HOOKS_DOMAIN:-$PRIMARY_DOMAIN}
+    success "Кабинет: $PRIMARY_DOMAIN, API: $HOOKS_DOMAIN"
   fi
   
-  # Если не нашли или пользователь отказался — спрашиваем вручную
-  echo ""
-  info "Не удалось авто-определить домены или вы отказались."
-  read -p "🌐 Введите основной домен для проверок (например, app.yoursite.st): " PRIMARY_DOMAIN
-  if [ -z "$PRIMARY_DOMAIN" ]; then
-    error "Домен обязателен для проверок!"
-    return 1
-  fi
-  success "Используем домен: $PRIMARY_DOMAIN"
+  return 0
 }
 
 # ===== ЗАГРУЗКА ИЛИ СОЗДАНИЕ КОНФИГА =====
@@ -340,7 +357,7 @@ do_check() {
     success "Все контейнеры: healthy 🟢"
   fi
 
-  # Кабинет (используем авто-детект домена)
+  # Кабинет (используем выбранный домен)
   if [ -n "$PRIMARY_DOMAIN" ]; then
     info "Проверка кабинета: $PRIMARY_DOMAIN..."
     if curl -s -o /dev/null -w "%{http_code}" "https://$PRIMARY_DOMAIN" | grep -q "200"; then
@@ -350,33 +367,21 @@ do_check() {
       STATUS=1
     fi
   else
-    info "Домен не определён — пропускаем проверку кабинета"
+    info "Домен кабинета не определён — пропускаем проверку"
   fi
 
-  # API endpoint (проверяем через hooks или api поддомен, если найден)
-  info "Проверка API endpoint..."
-  # Пытаемся угадать API домен
-  local API_DOMAIN=""
-  if [[ "$PRIMARY_DOMAIN" =~ ^app\. ]]; then
-    API_DOMAIN="${PRIMARY_DOMAIN/app./api.}"
-  elif [[ "$PRIMARY_DOMAIN" =~ ^hooks\. ]]; then
-    API_DOMAIN="$PRIMARY_DOMAIN"
-  else
-    API_DOMAIN="api.$PRIMARY_DOMAIN"
-  fi
-  
-  API_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://$API_DOMAIN" 2>/dev/null || echo "000")
-  if [[ "$API_CODE" =~ ^(200|404|405|401|403)$ ]]; then
-    success "API endpoint ($API_DOMAIN) доступен (код: $API_CODE) 🟢"
-  else
-    # Пробуем fallback на hooks
-    FALLBACK_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://hooks.$(echo $PRIMARY_DOMAIN | sed 's/^[^.]*\.//')" 2>/dev/null || echo "000")
-    if [[ "$FALLBACK_CODE" =~ ^(200|404|405|401|403)$ ]]; then
-      success "API endpoint (fallback) доступен (код: $FALLBACK_CODE) 🟢"
+  # API endpoint (используем выбранный домен)
+  if [ -n "$HOOKS_DOMAIN" ]; then
+    info "Проверка API endpoint: $HOOKS_DOMAIN..."
+    API_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://$HOOKS_DOMAIN" 2>/dev/null || echo "000")
+    if [[ "$API_CODE" =~ ^(200|404|405|401|403)$ ]]; then
+      success "API ($HOOKS_DOMAIN): код $API_CODE 🟢"
     else
-      error "API endpoint не отвечает (код: $API_CODE) ❌"
+      error "API ($HOOKS_DOMAIN): не отвечает (код: $API_CODE) ❌"
       STATUS=1
     fi
+  else
+    info "Домен API не определён — пропускаем проверку"
   fi
 
   return $STATUS
