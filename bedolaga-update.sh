@@ -486,6 +486,25 @@ check_updates() {
   fi
 }
 
+# ===== АВТО-ДЕТЕКТ POSTGRESQL =====
+detect_pg_credentials() {
+  PG_USER=$(grep -oE 'POSTGRES_USER=\S+' "$BOT_DIR/.env" 2>/dev/null | cut -d= -f2)
+  PG_DB=$(grep -oE 'POSTGRES_DB=\S+'   "$BOT_DIR/.env" 2>/dev/null | cut -d= -f2)
+
+  if [ -z "$PG_USER" ]; then
+    PG_USER=$(grep 'POSTGRES_USER:-' "$BOT_DIR/docker-compose.yml" 2>/dev/null \
+      | sed 's/.*POSTGRES_USER:-\([^}]*\).*/\1/' | head -1 | xargs)
+  fi
+  if [ -z "$PG_DB" ]; then
+    PG_DB=$(grep 'POSTGRES_DB:-' "$BOT_DIR/docker-compose.yml" 2>/dev/null \
+      | sed 's/.*POSTGRES_DB:-\([^}]*\).*/\1/' | head -1 | xargs)
+  fi
+
+  PG_USER="${PG_USER:-postgres}"
+  PG_DB="${PG_DB:-postgres}"
+  info "БД: пользователь=$PG_USER база=$PG_DB" >&2
+}
+
 # ===== БЭКАП =====
 do_backup() {
   local BACKUP_START; BACKUP_START=$(date +%s)
@@ -496,11 +515,10 @@ do_backup() {
   info "Конфиги бота..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; return 1; }
   cp .env docker-compose.yml "$BD/bot/"; check_backup_file "$BD/bot/.env" ".env"; check_backup_file "$BD/bot/docker-compose.yml" "docker-compose.yml"
 
-  info "БД..." >&2; local PV=$(docker volume ls | grep postgres_data | awk '{print $2}')
-  if [ -n "$PV" ]; then
-    docker run --rm -v "$PV":/source -v "$BD/bot":/backup alpine tar -czf /backup/postgres_data.tar.gz -C /source .
-    check_backup_file "$BD/bot/postgres_data.tar.gz" "PostgreSQL" || { error "Бэкап БД не создан!" >&2; return 1; }
-  else error "Том БД не найден" >&2; fi
+  info "БД..." >&2
+  detect_pg_credentials
+  docker exec remnawave_bot_db pg_dump -Fc -U "$PG_USER" "$PG_DB" > "$BD/bot/postgres.dump"
+  check_backup_file "$BD/bot/postgres.dump" "PostgreSQL" || { error "Бэкап БД не создан!" >&2; return 1; }
 
   info "Redis..." >&2; local RV=$(docker volume ls | grep redis_data | awk '{print $2}')
   if [ -n "$RV" ]; then
@@ -538,7 +556,7 @@ do_backup() {
     [ "$ELAPSED" -ge 60 ] && ELAPSED_FMT="$((ELAPSED/60))м $((ELAPSED%60))с" || ELAPSED_FMT="${ELAPSED}с"
 
     local FILES_INFO="" FP FSZ FNAME
-    for FNAME in ".env" "docker-compose.yml" "postgres_data.tar.gz" "redis_data.tar.gz"; do
+    for FNAME in ".env" "docker-compose.yml" "postgres.dump" "redis_data.tar.gz"; do
       FP="$BD/bot/$FNAME"
       if [ -f "$FP" ]; then
         FSZ=$(ls -lh "$FP" | awk '{print $5}')
@@ -762,11 +780,11 @@ do_restore() {
   cp "$BD/bot/docker-compose.yml" "$BOT_DIR/docker-compose.yml" && success "docker-compose.yml ✅" >&2 || error "docker-compose.yml ❌" >&2
 
   info "Восстановление PostgreSQL..." >&2
-  local PV; PV=$(docker volume ls | grep postgres_data | awk '{print $2}')
-  if [ -n "$PV" ] && [ -f "$BD/bot/postgres_data.tar.gz" ]; then
-    docker run --rm -v "$PV":/target -v "$BD/bot":/backup alpine sh -c "rm -rf /target/* && tar -xzf /backup/postgres_data.tar.gz -C /target" \
+  detect_pg_credentials
+  if [ -f "$BD/bot/postgres.dump" ]; then
+    docker exec -i remnawave_bot_db pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists < "$BD/bot/postgres.dump" \
       && success "PostgreSQL ✅" >&2 || error "PostgreSQL ❌" >&2
-  else warn "PostgreSQL: том или архив не найден, пропущено" >&2; fi
+  else warn "PostgreSQL: файл postgres.dump не найден, пропущено" >&2; fi
 
   info "Восстановление Redis..." >&2
   local RV; RV=$(docker volume ls | grep redis_data | awk '{print $2}')
