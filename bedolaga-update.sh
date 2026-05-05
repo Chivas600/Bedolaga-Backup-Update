@@ -203,6 +203,7 @@ BACKUP_SERVER="$BACKUP_SERVER"
 BACKUP_USER="$BACKUP_USER"
 BACKUP_REMOTE_DIR="$BACKUP_REMOTE_DIR"
 BACKUP_RETENTION="$BACKUP_RETENTION"
+BACKUP_SSH_PORT="$BACKUP_SSH_PORT"
 BOT_DIR="$BOT_DIR"
 CABINET_DIR="$CABINET_DIR"
 CADDY_DIR="$CADDY_DIR"
@@ -251,7 +252,7 @@ rotate_remote_backups() {
   info "Подключение к серверу для ротации..." >&2
 
   local RET=${BACKUP_RETENTION:-7}
-  local SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
+  local SSH="ssh -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
 
   local ALL=$($SSH "ls -1d ${BACKUP_REMOTE_DIR}/bedolaga-full-backup-* 2>/dev/null | sort" || true)
   [ -z "$ALL" ] && { info "На удалённом сервере нет бэкапов ✅" >&2; return 0; }
@@ -301,6 +302,7 @@ if [ -f "$CONFIG_FILE" ]; then
   BACKUP_USER="${BACKUP_USER:-root}"
   BACKUP_REMOTE_DIR="${BACKUP_REMOTE_DIR:-/root/bedolaga-backups}"
   BACKUP_RETENTION="${BACKUP_RETENTION:-7}"
+  BACKUP_SSH_PORT="${BACKUP_SSH_PORT:-22}"
   [[ ! "$BACKUP_RETENTION" =~ ^[0-9]+$ ]] && BACKUP_RETENTION=7
   if ! check_critical_config; then
     warn "Конфиг неполный — запускаю полную настройку..." >&2
@@ -321,6 +323,7 @@ if [ "$NEED_FULL_SETUP" = true ]; then
     read -p "🌐 IP резервного сервера: " BACKUP_SERVER >&2
     [ -z "$BACKUP_SERVER" ] && error "Обязательно!" >&2
   done
+  read -p "🔌 SSH порт резервного сервера [22]: " SP >&2; BACKUP_SSH_PORT="${SP:-22}"; [ -z "$SP" ] && success "22" >&2
   read -p "👤 Пользователь [root]: " U >&2; BACKUP_USER="${U:-root}"; [ -z "$U" ] && success "root" >&2
   read -p "📁 Путь бэкапов [/root/bedolaga-backups]: " P >&2; BACKUP_REMOTE_DIR="${P:-/root/bedolaga-backups}"; [ -z "$P" ] && success "по умолчанию" >&2
   read -p "📦 Хранить бэкапов [7]: " R >&2; BACKUP_RETENTION="${R:-7}"; [ -z "$R" ] && success "7" >&2
@@ -398,6 +401,8 @@ do_settings() {
       [ -n "$NP" ] && BACKUP_REMOTE_DIR="$NP"
       read -p "📦 Хранить бэкапов [${BACKUP_RETENTION:-7}]: " NR >&2
       [ -n "$NR" ] && BACKUP_RETENTION="$NR"
+      read -p "🔌 SSH порт [${BACKUP_SSH_PORT:-22}]: " NSSP >&2
+      [ -n "$NSSP" ] && BACKUP_SSH_PORT="$NSSP"
       save_all_config
       ;;
     5)
@@ -541,7 +546,7 @@ do_backup() {
   if [ -z "$BACKUP_SERVER" ]; then
     warn "Резервный сервер не указан. Копирование пропущено." >&2
   else
-    scp -i "$SSH_KEY" -r -o StrictHostKeyChecking=no "$BD" "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/" \
+    scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "$BD" "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/" \
       && success "Скопировано ✅" >&2 \
       || { error "Ошибка копирования ❌" >&2; log "❌ scp failed"; SCP_STATUS=1; }
   fi
