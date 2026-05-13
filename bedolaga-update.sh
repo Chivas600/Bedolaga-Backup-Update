@@ -408,17 +408,20 @@ do_settings() {
     5)
       echo "" >&2
       info "Текущий cron:" >&2
-      crontab -l 2>/dev/null | grep bedolaga >&2 || info "Cron не настроен" >&2
+      local CRON_FILE="/etc/cron.d/bedolaga-backup"
+      if [ -f "$CRON_FILE" ]; then
+        cat "$CRON_FILE" >&2
+      else
+        info "Cron не настроен" >&2
+      fi
       echo "" >&2
       read -p "⏰ Час запуска [0-23]: " CH >&2
       read -p "⏰ Минута запуска [0-59]: " CM >&2
       if [[ "$CH" =~ ^[0-9]+$ ]] && [ "$CH" -ge 0 ] && [ "$CH" -le 23 ] && \
          [[ "$CM" =~ ^[0-9]+$ ]] && [ "$CM" -ge 0 ] && [ "$CM" -le 59 ]; then
         local SCRIPT_PATH; SCRIPT_PATH="$(realpath "$0")"
-        local TMPFILE; TMPFILE=$(mktemp)
-        crontab -l 2>/dev/null | grep -v bedolaga > "$TMPFILE"
-        echo "$CM $CH * * * $SCRIPT_PATH --cron >> /root/bedolaga-cron.log 2>&1" >> "$TMPFILE"
-        crontab "$TMPFILE"; rm -f "$TMPFILE"
+        echo "$CM $CH * * * root $SCRIPT_PATH --cron >> /var/log/bedolaga-cron.log 2>&1" > "$CRON_FILE"
+        chmod 644 "$CRON_FILE"
         success "Cron обновлён: $CM $CH * * * $SCRIPT_PATH --cron" >&2
       else
         error "Некорректное время" >&2; return 1
