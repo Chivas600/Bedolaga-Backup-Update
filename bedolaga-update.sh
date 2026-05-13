@@ -476,18 +476,18 @@ check_updates() {
 
   local UPDATES="" ALL_OK=true
   if [ -n "$BOT_LATEST" ] && [ -n "$BOT_VER" ] && [ "$BOT_VER" != "$BOT_LATEST" ]; then
-    UPDATES="${UPDATES}  Бот: ${BOT_VER} → ${BOT_LATEST}\n"
+    UPDATES="${UPDATES}  Бот: ${BOT_VER} → ${BOT_LATEST}"$'\n'
     ALL_OK=false
   fi
   if [ -n "$CABINET_LATEST" ] && [ -n "$CABINET_VER" ] && [ "$CABINET_VER" != "$CABINET_LATEST" ]; then
-    UPDATES="${UPDATES}  Кабинет: ${CABINET_VER} → ${CABINET_LATEST}\n"
+    UPDATES="${UPDATES}  Кабинет: ${CABINET_VER} → ${CABINET_LATEST}"$'\n'
     ALL_OK=false
   fi
 
   if [ "$ALL_OK" = true ]; then
     CHECK_UPDATES_RESULT="✅ Версии актуальны: Бот ${BOT_LATEST:-${BOT_VER:-?}}, Кабинет ${CABINET_LATEST:-${CABINET_VER:-?}}"
   else
-    CHECK_UPDATES_RESULT="⚠️ <b>Доступны обновления:</b>\n${UPDATES}<b>Обновись: запусти bedolaga-update и выбери пункт 2 или 3</b>"
+    CHECK_UPDATES_RESULT="⚠️ <b>Доступны обновления:</b>"$'\n'"${UPDATES}<b>Обновись: запусти bedolaga-update и выбери пункт 2 или 3</b>"
   fi
 }
 
