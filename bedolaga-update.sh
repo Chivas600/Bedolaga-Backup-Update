@@ -358,6 +358,8 @@ check_disk_space() {
   success "Место: ${AVAIL}МБ ✅" >&2; return 0
 }
 
+CUSTOM_FILES="/root/.bedolaga-custom-files"
+
 # ===== НАСТРОЙКИ =====
 do_settings() {
   header "⚙️ НАСТРОЙКИ" >&2
@@ -619,8 +621,6 @@ ${CHECK_UPDATES_RESULT}"
   return $SCP_STATUS
 }
 
-# ===== КАСТОМНЫЕ ФАЙЛЫ =====
-CUSTOM_FILES="/root/.bedolaga-custom-files"
 
 save_custom_files() {
   local PROJECT_DIR="$1" SUBDIR="$2"
@@ -676,16 +676,18 @@ do_update() {
 
   info "Бот..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; return 1; }
   save_custom_files "$BOT_DIR" "bot"
-  git fetch origin && git reset --hard origin/main
+  _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
+  git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$BOT_DIR" "bot"
   docker compose down
   docker compose up -d --build bot
   sleep 10
-  if docker compose ps | grep -q "remnawave_bot.*healthy"; then success "Бот: healthy ✅" >&2; else warn "Бот: проверка ⚠️" >&2; docker compose logs --tail=20 bot||true; fi
+  if docker compose ps | grep -q "remnawave_bot.*(healthy)"; then success "Бот: healthy ✅" >&2; else warn "Бот: проверка ⚠️" >&2; docker compose logs --tail=20 bot||true; fi
 
   info "Кабинет..." >&2; cd "$CABINET_DIR" || { error "Папка кабинета не найдена" >&2; return 1; }
   save_custom_files "$CABINET_DIR" "cabinet"
-  git fetch origin && git reset --hard origin/main
+  _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
+  git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$CABINET_DIR" "cabinet"
   npm install --silent
   npm run build --silent
@@ -720,8 +722,8 @@ do_check() {
   else
     success "Все контейнеры работают штатно 🟢" >&2
   fi
-  [ -n "$PRIMARY_DOMAIN" ] && { info "Кабинет: $PRIMARY_DOMAIN..." >&2; curl -s -o /dev/null -w "%{http_code}" "https://$PRIMARY_DOMAIN" | grep -q "200" && success "Кабинет: 200 🟢" >&2 || { error "Кабинет: не отвечает ❌" >&2; }; }
-  [ -n "$HOOKS_DOMAIN" ] && { info "API: $HOOKS_DOMAIN..." >&2; local AC=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 "https://$HOOKS_DOMAIN" 2>/dev/null||echo "000"); [[ "$AC" =~ ^(200|404|405|401|403)$ ]] && success "API: $AC 🟢" >&2 || { error "API: код $AC ❌" >&2; }; }
+  [ -n "$PRIMARY_DOMAIN" ] && { info "Кабинет: $PRIMARY_DOMAIN..." >&2; curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$PRIMARY_DOMAIN" | grep -q "200" && success "Кабинет: 200 🟢" >&2 || { error "Кабинет: не отвечает ❌" >&2; }; }
+  [ -n "$HOOKS_DOMAIN" ] && { info "API: $HOOKS_DOMAIN..." >&2; local AC=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 --max-time 10 "https://$HOOKS_DOMAIN" 2>/dev/null||echo "000"); [[ "$AC" =~ ^(200|404|405|401|403)$ ]] && success "API: $AC 🟢" >&2 || { error "API: код $AC ❌" >&2; }; }
   return 0
 }
 
