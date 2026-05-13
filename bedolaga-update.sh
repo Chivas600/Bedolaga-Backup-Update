@@ -463,11 +463,8 @@ check_updates() {
   local BOT_VER CABINET_VER BOT_LATEST CABINET_LATEST
   CHECK_UPDATES_RESULT=""
 
-  BOT_VER=$(grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' "$BOT_DIR/.env" 2>/dev/null | head -1)
-  [ -z "$BOT_VER" ] && BOT_VER=$(grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' "$BOT_DIR/docker-compose.yml" 2>/dev/null | head -1)
-
-  CABINET_VER=$(grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' "$CABINET_DIR/.env" 2>/dev/null | head -1)
-  [ -z "$CABINET_VER" ] && CABINET_VER=$(grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' "$CABINET_DIR/docker-compose.yml" 2>/dev/null | head -1)
+  BOT_VER=$(git -C "$BOT_DIR" describe --tags --abbrev=0 2>/dev/null || echo "")
+  CABINET_VER=$(git -C "$CABINET_DIR" describe --tags --abbrev=0 2>/dev/null || echo "")
 
   BOT_LATEST=$(curl -s "https://api.github.com/repos/BEDOLAGA-DEV/remnawave-bedolaga-telegram-bot/releases/latest" \
     | grep '"tag_name"' | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
