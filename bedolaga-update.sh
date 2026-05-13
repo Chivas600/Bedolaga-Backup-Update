@@ -487,7 +487,7 @@ check_updates() {
   if [ "$ALL_OK" = true ]; then
     CHECK_UPDATES_RESULT="✅ Версии актуальны: Бот ${BOT_LATEST:-${BOT_VER:-?}}, Кабинет ${CABINET_LATEST:-${CABINET_VER:-?}}"
   else
-    CHECK_UPDATES_RESULT="🆕 Доступны обновления:\n${UPDATES}Обновись: запусти bedolaga-update и выбери пункт 2 или 3"
+    CHECK_UPDATES_RESULT="⚠️ <b>Доступны обновления:</b>\n${UPDATES}<b>Обновись: запусти bedolaga-update и выбери пункт 2 или 3</b>"
   fi
 }
 
