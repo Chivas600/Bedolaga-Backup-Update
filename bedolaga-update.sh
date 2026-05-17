@@ -596,6 +596,7 @@ do_backup() {
     [ "$SCP_STATUS" -eq 0 ] && SCP_TEXT="✅ OK (${BACKUP_USER}@${BACKUP_SERVER})" || SCP_TEXT="❌ Ошибка"
 
     check_updates
+    check_smtp
     local TG_MSG
     TG_MSG="🤖 <b>Bedolaga Backup</b> — $(date '+%Y-%m-%d %H:%M')
 
@@ -612,6 +613,7 @@ ${DOCKER_STATUS}
 📡 <b>Копия на сервер:</b> ${SCP_TEXT}
 🗂 <b>Бэкапов хранится:</b> ${LOCAL_CNT}
 ⏱ <b>Время выполнения:</b> ${ELAPSED_FMT}
+📧 <b>SMTP:</b> ${SMTP_CHECK_RESULT}
 
 ${CHECK_UPDATES_RESULT}"
 
@@ -706,6 +708,72 @@ do_update() {
   log "Обновление завершено"; return 0
 }
 
+# ===== ПРОВЕРКА SMTP =====
+SMTP_CHECK_RESULT=""
+check_smtp() {
+  local ENV_FILE="$BOT_DIR/.env"
+  [ -f "$ENV_FILE" ] || { SMTP_CHECK_RESULT="⚪ SMTP: .env не найден"; return 0; }
+
+  local HOST SMTP_U PASS PORT TLS
+  HOST=$(grep -E '^SMTP_HOST=' "$ENV_FILE" | cut -d= -f2 | xargs)
+  SMTP_U=$(grep -E '^SMTP_USER=' "$ENV_FILE" | cut -d= -f2 | xargs)
+  PASS=$(grep -E '^SMTP_PASSWORD=' "$ENV_FILE" | cut -d= -f2 | xargs)
+  PORT=$(grep -E '^SMTP_PORT=' "$ENV_FILE" | cut -d= -f2 | xargs)
+  TLS=$(grep -E '^SMTP_USE_TLS=' "$ENV_FILE" | cut -d= -f2 | xargs)
+  PORT="${PORT:-587}"
+
+  if [ -z "$HOST" ] || [ -z "$SMTP_U" ] || [ -z "$PASS" ]; then
+    SMTP_CHECK_RESULT="⚪ SMTP: не настроен"
+    return 0
+  fi
+
+  info "SMTP: проверка $SMTP_U@$HOST:$PORT..." >&2
+
+  local RESULT
+  RESULT=$(docker exec \
+    -e SMTP_HOST="$HOST" \
+    -e SMTP_PORT="$PORT" \
+    -e SMTP_USER="$SMTP_U" \
+    -e SMTP_PASSWORD="$PASS" \
+    -e SMTP_USE_TLS="$TLS" \
+    remnawave_bot python3 -c '
+import smtplib, os
+host = os.environ["SMTP_HOST"]
+port = int(os.environ["SMTP_PORT"])
+user = os.environ["SMTP_USER"]
+password = os.environ["SMTP_PASSWORD"]
+use_tls = os.environ["SMTP_USE_TLS"].lower() in ("true", "1", "yes")
+try:
+    if port == 465:
+        s = smtplib.SMTP_SSL(host, port, timeout=15)
+        s.ehlo()
+    else:
+        s = smtplib.SMTP(host, port, timeout=15)
+        s.ehlo()
+        if use_tls:
+            s.starttls()
+            s.ehlo()
+    s.login(user, password)
+    s.quit()
+    print("OK")
+except Exception as e:
+    print(f"FAIL:{e}")
+' 2>&1) || true
+
+  if [ -z "$RESULT" ]; then
+    SMTP_CHECK_RESULT="⚪ SMTP: контейнер недоступен"
+    warn "SMTP: контейнер remnawave_bot недоступен ⚠️" >&2
+  elif [ "$RESULT" = "OK" ]; then
+    SMTP_CHECK_RESULT="✅ SMTP: $SMTP_U@$HOST:$PORT — OK 🟢"
+    success "SMTP: авторизация успешна 🟢" >&2
+  else
+    local ERR="${RESULT#FAIL:}"
+    SMTP_CHECK_RESULT="❌ SMTP: $SMTP_U@$HOST:$PORT — $ERR"
+    error "SMTP: $ERR ❌" >&2
+    HEALTH_WARN=1
+  fi
+}
+
 # ===== ПРОВЕРКА =====
 do_check() {
   header "✅ ПРОВЕРКА" >&2
@@ -723,7 +791,8 @@ do_check() {
     success "Все контейнеры работают штатно 🟢" >&2
   fi
   [ -n "$PRIMARY_DOMAIN" ] && { info "Кабинет: $PRIMARY_DOMAIN..." >&2; curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$PRIMARY_DOMAIN" | grep -q "200" && success "Кабинет: 200 🟢" >&2 || { error "Кабинет: не отвечает ❌" >&2; }; }
-  [ -n "$HOOKS_DOMAIN" ] && { info "API: $HOOKS_DOMAIN..." >&2; local AC=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 --max-time 10 "https://$HOOKS_DOMAIN" 2>/dev/null||echo "000"); [[ "$AC" =~ ^(200|404|405|401|403)$ ]] && success "API: $AC 🟢" >&2 || { error "API: код $AC ❌" >&2; }; }
+  [ -n "$HOOKS_DOMAIN" ] && { info "API: $HOOKS_DOMAIN..." >&2; local AC; AC=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 --max-time 10 "https://$HOOKS_DOMAIN" 2>/dev/null); AC="${AC:-000}"; [[ "$AC" =~ ^(200|404|405|401|403)$ ]] && success "API: $AC 🟢" >&2 || { error "API: код $AC ❌" >&2; }; }
+  check_smtp
   return 0
 }
 
