@@ -531,39 +531,90 @@ detect_pg_credentials() {
 
   PG_USER="${PG_USER:-postgres}"
   PG_DB="${PG_DB:-postgres}"
-  info "БД: пользователь=$PG_USER база=$PG_DB" >&2
+
+  # Детект имён контейнеров (не хардкодим — поддержка нестандартных имён/инстансов)
+  PG_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'bot_db|postgres|_db$' | head -1)
+  PG_CONTAINER="${PG_CONTAINER:-remnawave_bot_db}"
+  REDIS_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i 'redis' | head -1)
+  REDIS_CONTAINER="${REDIS_CONTAINER:-remnawave_bot_redis}"
+
+  info "БД: пользователь=$PG_USER база=$PG_DB контейнер=$PG_CONTAINER" >&2
 }
 
 # ===== БЭКАП =====
 do_backup() {
   local BACKUP_START; BACKUP_START=$(date +%s)
   header "📦 БЭКАП" >&2; check_disk_space "/root" || return 1
-  local BD="/root/bedolaga-local-backups/bedolaga-full-backup-$(date +%Y%m%d-%H%M)"
-  mkdir -p "$BD/bot" "$BD/cabinet" "$BD/caddy"; log "Создано: $BD"
+  local TS; TS=$(date +%Y%m%d-%H%M)
+  local BD="/root/bedolaga-local-backups/bedolaga-full-backup-$TS"
+  local STAGE; STAGE=$(mktemp -d "/tmp/bedolaga-stage-$TS.XXXXXX")
+  mkdir -p "$BD" "$STAGE/bot" "$STAGE/cabinet" "$STAGE/caddy"; log "Создано: $BD"
 
-  info "Конфиги бота..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; return 1; }
-  cp .env docker-compose.yml "$BD/bot/"; check_backup_file "$BD/bot/.env" ".env"; check_backup_file "$BD/bot/docker-compose.yml" "docker-compose.yml"
+  info "Конфиги бота..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; rm -rf "$STAGE"; return 1; }
+  cp .env docker-compose.yml "$STAGE/bot/"; check_backup_file "$STAGE/bot/.env" ".env"; check_backup_file "$STAGE/bot/docker-compose.yml" "docker-compose.yml"
 
   info "БД..." >&2
   detect_pg_credentials
-  docker exec remnawave_bot_db pg_dump -Fc -U "$PG_USER" "$PG_DB" > "$BD/bot/postgres.dump"
-  check_backup_file "$BD/bot/postgres.dump" "PostgreSQL" || { error "Бэкап БД не создан!" >&2; return 1; }
+  # pg_dump с защитой от set -e: ошибку ловим сами, а не роняем скрипт
+  if ! docker exec "$PG_CONTAINER" pg_dump -Fc -U "$PG_USER" "$PG_DB" > "$STAGE/bot/postgres.dump" 2>/dev/null; then
+    error "pg_dump завершился с ошибкой ❌" >&2; log "❌ pg_dump failed"; rm -rf "$STAGE"; return 1
+  fi
+  check_backup_file "$STAGE/bot/postgres.dump" "PostgreSQL" || { error "Бэкап БД не создан!" >&2; rm -rf "$STAGE"; return 1; }
+  # Верификация: структура дампа должна читаться pg_restore --list (битый/пустой дамп отсеиваем здесь)
+  if docker exec -i "$PG_CONTAINER" pg_restore --list < "$STAGE/bot/postgres.dump" >/dev/null 2>&1; then
+    success "PostgreSQL: дамп валиден (pg_restore --list) ✅" >&2
+  else
+    error "PostgreSQL: дамп НЕ проходит pg_restore --list — повреждён ❌" >&2; log "❌ pg dump invalid"; rm -rf "$STAGE"; return 1
+  fi
 
-  info "Redis..." >&2; local RV=$(docker volume ls | grep redis_data | awk '{print $2}')
+  info "Redis..." >&2
+  # BGSAVE для консистентного снапшота перед архивацией тома
+  docker exec "$REDIS_CONTAINER" redis-cli BGSAVE >/dev/null 2>&1 && sleep 2 || true
+  local RV; RV=$(docker volume ls | grep redis_data | awk '{print $2}')
   if [ -n "$RV" ]; then
-    docker run --rm -v "$RV":/source -v "$BD/bot":/backup alpine tar -czf /backup/redis_data.tar.gz -C /source .
-    check_backup_file "$BD/bot/redis_data.tar.gz" "Redis"
+    docker run --rm -v "$RV":/source -v "$STAGE/bot":/backup alpine tar -czf /backup/redis_data.tar.gz -C /source .
+    check_backup_file "$STAGE/bot/redis_data.tar.gz" "Redis"
   fi
 
   info "Кабинет..." >&2
   if [ -d "$CABINET_DIR" ]; then
-    cd "$CABINET_DIR" 2>/dev/null && { cp .env package*.json "$BD/cabinet/" 2>/dev/null||true; cp -r src/ "$BD/cabinet/" 2>/dev/null||true; }
-    [ -f "$BD/cabinet/.env" ] && success "Конфиг ✅" >&2||info "Конфиг не найден" >&2
-    [ -d "$BD/cabinet/src" ] && success "Код ✅" >&2||info "Код не найден" >&2
+    cd "$CABINET_DIR" 2>/dev/null && { cp .env package*.json "$STAGE/cabinet/" 2>/dev/null||true; cp -r src/ "$STAGE/cabinet/" 2>/dev/null||true; }
+    [ -f "$STAGE/cabinet/.env" ] && success "Конфиг ✅" >&2||info "Конфиг не найден" >&2
+    [ -d "$STAGE/cabinet/src" ] && success "Код ✅" >&2||info "Код не найден" >&2
   fi
   if [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ]; then
-    cp "$CADDY_DIR/Caddyfile" "$BD/caddy/" 2>/dev/null && success "Caddy ✅" >&2
+    cp "$CADDY_DIR/Caddyfile" "$STAGE/caddy/" 2>/dev/null && success "Caddy ✅" >&2
   fi
+
+  # ---- Архивация компонентов в отдельные tar.zst ----
+  header "🗜 АРХИВАЦИЯ КОМПОНЕНТОВ" >&2
+  local COMP
+  for COMP in bot cabinet caddy; do
+    if [ -z "$(ls -A "$STAGE/$COMP" 2>/dev/null)" ]; then
+      info "Компонент '$COMP' пуст — пропуск" >&2; continue
+    fi
+    local ARCHIVE="$BD/${COMP}-${TS}.tar.zst"
+    if tar -C "$STAGE" -cf - "$COMP" | zstd -q -T0 -19 > "$ARCHIVE" && zstd -tq "$ARCHIVE" 2>/dev/null; then
+      check_backup_file "$ARCHIVE" "${COMP}.tar.zst"
+    else
+      error "Архивация '$COMP' не удалась ❌" >&2; log "❌ archive $COMP failed"; rm -rf "$STAGE"; return 1
+    fi
+  done
+
+  # ---- Манифест + контрольные суммы ----
+  ( cd "$BD" && sha256sum *.tar.zst > SHA256SUMS 2>/dev/null ) || true
+  {
+    echo "bedolaga-backup-format: 3"
+    echo "created: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "timestamp: $TS"
+    echo "role: ${ROLE:-all}"
+    echo "host: $(hostname)"
+    echo "pg_user: $PG_USER"
+    echo "pg_db: $PG_DB"
+    echo "components:$(cd "$BD" && for f in *.tar.zst; do [ -e "$f" ] && printf ' %s' "${f%-$TS.tar.zst}"; done)"
+  } > "$BD/manifest.txt"
+  success "Манифест и SHA256SUMS записаны ✅" >&2
+  rm -rf "$STAGE"
 
   info "Копирование на сервер..." >&2
   local SCP_STATUS=0
@@ -586,30 +637,13 @@ do_backup() {
     local ELAPSED_FMT
     [ "$ELAPSED" -ge 60 ] && ELAPSED_FMT="$((ELAPSED/60))м $((ELAPSED%60))с" || ELAPSED_FMT="${ELAPSED}с"
 
-    local FILES_INFO="" FP FSZ FNAME
-    for FNAME in ".env" "docker-compose.yml" "postgres.dump" "redis_data.tar.gz"; do
-      FP="$BD/bot/$FNAME"
-      if [ -f "$FP" ]; then
-        FSZ=$(ls -lh "$FP" | awk '{print $5}')
-        FILES_INFO="${FILES_INFO}  ✅ ${FNAME} (${FSZ})"$'\n'
-      else
-        FILES_INFO="${FILES_INFO}  ❌ ${FNAME} (нет)"$'\n'
-      fi
+    local FILES_INFO="" FSZ ARCH
+    for ARCH in "$BD"/*.tar.zst; do
+      [ -e "$ARCH" ] || continue
+      FSZ=$(ls -lh "$ARCH" | awk '{print $5}')
+      FILES_INFO="${FILES_INFO}  ✅ $(basename "$ARCH") (${FSZ})"$'\n'
     done
-    FP="$BD/cabinet/.env"
-    if [ -f "$FP" ]; then
-      FSZ=$(ls -lh "$FP" | awk '{print $5}')
-      FILES_INFO="${FILES_INFO}  ✅ cabinet/.env (${FSZ})"$'\n'
-    else
-      FILES_INFO="${FILES_INFO}  ⚪ cabinet/.env"$'\n'
-    fi
-    FP="$BD/caddy/Caddyfile"
-    if [ -f "$FP" ]; then
-      FSZ=$(ls -lh "$FP" | awk '{print $5}')
-      FILES_INFO="${FILES_INFO}  ✅ Caddyfile (${FSZ})"$'\n'
-    else
-      FILES_INFO="${FILES_INFO}  ⚪ Caddyfile"$'\n'
-    fi
+    [ -z "$FILES_INFO" ] && FILES_INFO="  ❌ архивы не созданы"$'\n'
 
     local RAM_FREE; RAM_FREE=$(free -h | awk '/^Mem:/{print $7}')
     local DISK_FREE; DISK_FREE=$(df -h /root | awk 'NR==2{print $4}')
@@ -879,35 +913,60 @@ do_restore() {
 
   log "🔁 Начало восстановления из $(basename "$BD")"
 
+  # Определяем источник файлов: новый формат (компонентные архивы v3) или старый (россыпь v2)
+  local SRC SRC_TMP=""
+  if ls "$BD"/*.tar.zst >/dev/null 2>&1; then
+    info "Формат бэкапа: компонентные архивы (v3)" >&2
+    if [ -f "$BD/SHA256SUMS" ]; then
+      if ( cd "$BD" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
+        success "SHA256: контрольные суммы совпали ✅" >&2
+      else
+        error "SHA256: контрольные суммы НЕ совпали — архив повреждён ❌" >&2
+        read -p "Всё равно продолжить восстановление? [y/N]: " CX >&2
+        [[ "$CX" =~ ^[Yy]$ ]] || { info "Отменено" >&2; return 1; }
+      fi
+    fi
+    SRC_TMP=$(mktemp -d "/tmp/bedolaga-restore-XXXXXX"); SRC="$SRC_TMP"
+    local A
+    for A in "$BD"/*.tar.zst; do
+      info "Распаковка $(basename "$A")..." >&2
+      zstd -dc "$A" | tar -x -C "$SRC" || { error "Ошибка распаковки $(basename "$A") ❌" >&2; rm -rf "$SRC_TMP"; return 1; }
+    done
+    success "Архивы распакованы ✅" >&2
+  else
+    info "Формат бэкапа: россыпь файлов (v2, обратная совместимость)" >&2
+    SRC="$BD"
+  fi
+
   info "Остановка контейнеров..." >&2
   cd "$BOT_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
   cd "$CABINET_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
   [ -n "$CADDY_DIR" ] && cd "$CADDY_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
 
   info "Восстановление конфигов бота..." >&2
-  cp "$BD/bot/.env" "$BOT_DIR/.env" && success ".env бота ✅" >&2 || error ".env бота ❌" >&2
-  cp "$BD/bot/docker-compose.yml" "$BOT_DIR/docker-compose.yml" && success "docker-compose.yml ✅" >&2 || error "docker-compose.yml ❌" >&2
+  cp "$SRC/bot/.env" "$BOT_DIR/.env" && success ".env бота ✅" >&2 || error ".env бота ❌" >&2
+  cp "$SRC/bot/docker-compose.yml" "$BOT_DIR/docker-compose.yml" && success "docker-compose.yml ✅" >&2 || error "docker-compose.yml ❌" >&2
 
   info "Восстановление PostgreSQL..." >&2
   detect_pg_credentials
-  if [ -f "$BD/bot/postgres.dump" ]; then
-    docker exec -i remnawave_bot_db pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists < "$BD/bot/postgres.dump" \
+  if [ -f "$SRC/bot/postgres.dump" ]; then
+    docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists < "$SRC/bot/postgres.dump" \
       && success "PostgreSQL ✅" >&2 || error "PostgreSQL ❌" >&2
   else warn "PostgreSQL: файл postgres.dump не найден, пропущено" >&2; fi
 
   info "Восстановление Redis..." >&2
   local RV; RV=$(docker volume ls | grep redis_data | awk '{print $2}')
-  if [ -n "$RV" ] && [ -f "$BD/bot/redis_data.tar.gz" ]; then
-    docker run --rm -v "$RV":/target -v "$BD/bot":/backup alpine sh -c "rm -rf /target/* && tar -xzf /backup/redis_data.tar.gz -C /target" \
+  if [ -n "$RV" ] && [ -f "$SRC/bot/redis_data.tar.gz" ]; then
+    docker run --rm -v "$RV":/target -v "$SRC/bot":/backup alpine sh -c "rm -rf /target/* && tar -xzf /backup/redis_data.tar.gz -C /target" \
       && success "Redis ✅" >&2 || error "Redis ❌" >&2
   else warn "Redis: том или архив не найден, пропущено" >&2; fi
 
   info "Восстановление кабинета..." >&2
-  [ -f "$BD/cabinet/.env" ] && cp "$BD/cabinet/.env" "$CABINET_DIR/.env" && success "cabinet/.env ✅" >&2 || warn "cabinet/.env не найден" >&2
-  [ -d "$BD/cabinet/src" ] && cp -r "$BD/cabinet/src" "$CABINET_DIR/" && success "cabinet/src ✅" >&2 || warn "cabinet/src не найден" >&2
+  [ -f "$SRC/cabinet/.env" ] && cp "$SRC/cabinet/.env" "$CABINET_DIR/.env" && success "cabinet/.env ✅" >&2 || warn "cabinet/.env не найден" >&2
+  [ -d "$SRC/cabinet/src" ] && cp -r "$SRC/cabinet/src" "$CABINET_DIR/" && success "cabinet/src ✅" >&2 || warn "cabinet/src не найден" >&2
 
-  if [ -n "$CADDY_DIR" ] && [ -f "$BD/caddy/Caddyfile" ]; then
-    cp "$BD/caddy/Caddyfile" "$CADDY_DIR/Caddyfile" && success "Caddyfile ✅" >&2 || error "Caddyfile ❌" >&2
+  if [ -n "$CADDY_DIR" ] && [ -f "$SRC/caddy/Caddyfile" ]; then
+    cp "$SRC/caddy/Caddyfile" "$CADDY_DIR/Caddyfile" && success "Caddyfile ✅" >&2 || error "Caddyfile ❌" >&2
   fi
 
   info "Запуск контейнеров..." >&2
@@ -926,6 +985,7 @@ do_restore() {
 Восстановление из бэкапа <b>${DT_LABEL}</b> выполнено.
 Проверьте контейнеры и работоспособность сервисов."
 
+  [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
   log "✅ Восстановление завершено"
 }
 
