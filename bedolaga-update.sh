@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
+VERSION="3.0.0"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -878,9 +879,9 @@ elif [ "$CRON_MODE" = true ]; then
   log "🚀 Запуск (cron)"
   ACT=1
 else
-  clear; echo -e "\033[1;36m"
+  clear 2>/dev/null || true; echo -e "\033[1;36m"
   echo "╔════════════════════════════════════╗"
-  echo "║  🤖 Bedolaga: Обновление системы  ║"
+  echo "║  🤖 Bedolaga Backup & Update v${VERSION}  ║"
   echo "╚════════════════════════════════════╝"
   echo -e "\033[0m"
   log "🚀 Запуск"; info "Сервер: ${BACKUP_USER:-?}@${BACKUP_SERVER:-НЕ УКАЗАН}" >&2; info "Бот: $BOT_DIR" >&2; info "Кабинет: $CABINET_DIR" >&2; info "Caddy: ${CADDY_DIR:-нет}" >&2
