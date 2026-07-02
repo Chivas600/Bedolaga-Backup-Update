@@ -10,9 +10,26 @@ header()  { echo -e "\n\033[1;36m=== $1 ===\033[0m\n" >&2; }
 
 CONFIG_FILE="/root/.bedolaga-config"
 CRON_MODE=false
-[[ "${1:-}" == "--cron" ]] && CRON_MODE=true
+DRY_RUN=false
+for _arg in "$@"; do
+  case "$_arg" in
+    --cron)    CRON_MODE=true ;;
+    --dry-run) DRY_RUN=true ;;
+  esac
+done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
+
+# ===== DRY-RUN =====
+# guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
+# Используется для потенциально опасных/исходящих операций (scp, ssh rm, rm -rf, docker и т.п.).
+guard() {
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] пропущено: $*" >&2
+    return 0
+  fi
+  "$@"
+}
 
 clean_domain() { local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; echo "$d" | xargs; }
 is_valid_domain() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; }
@@ -239,7 +256,7 @@ rotate_local_backups() {
     local DEL=$((CNT - BACKUP_RETENTION)); info "Удаляем $DEL старых..." >&2
     ls -1d "$DIR"/bedolaga-full-backup-* 2>/dev/null | head -n "$DEL" | while read OLD; do
       local DT=$(basename "$OLD"|sed 's/bedolaga-full-backup-//'); local SZ=$(du -sh "$OLD"|awk '{print $1}')
-      info "Удаляем: $DT ($SZ)..." >&2; rm -rf "$OLD" && success "Удалён ✅" >&2 || error "Ошибка ❌" >&2
+      info "Удаляем: $DT ($SZ)..." >&2; guard rm -rf "$OLD" && success "Удалён ✅" >&2 || error "Ошибка ❌" >&2
       log "Локальный удалён: $DT ($SZ)"
     done
   else info "Бэкапов: $CNT/$BACKUP_RETENTION ✅" >&2; fi
@@ -264,6 +281,10 @@ rotate_remote_backups() {
     local DEL=$((CNT - RET))
     info "Удаляем $DEL старых..." >&2
     local DEL_LIST=$(echo "$ALL" | head -n "$DEL" | tr '\n' ' ')
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] ssh rm -rf $DEL_LIST (пропущено)" >&2
+      return 0
+    fi
     if $SSH "rm -rf $DEL_LIST" 2>&1; then
       success "Удалено $DEL бэкапов с сервера ✅" >&2
       echo "$ALL" | head -n "$DEL" | while read BP; do
@@ -282,6 +303,7 @@ rotate_remote_backups() {
 # ===== TELEGRAM =====
 send_telegram() {
   local MSG="$1"
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] Telegram-сообщение не отправляется" >&2; return 0; fi
   if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then return 0; fi
   local THREAD_ARGS=()
   [ -n "$TG_THREAD_ID" ] && THREAD_ARGS=(-d "message_thread_id=${TG_THREAD_ID}")
@@ -547,6 +569,8 @@ do_backup() {
   local SCP_STATUS=0
   if [ -z "$BACKUP_SERVER" ]; then
     warn "Резервный сервер не указан. Копирование пропущено." >&2
+  elif [ "$DRY_RUN" = true ]; then
+    info "[dry-run] scp $BD → ${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/ (пропущено)" >&2
   else
     scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "$BD" "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/" \
       && success "Скопировано ✅" >&2 \
@@ -672,7 +696,12 @@ restore_custom_files() {
 
 # ===== ОБНОВЛЕНИЕ =====
 do_update() {
-  header "🔄 ОБНОВЛЕНИЕ" >&2; info "Запуск..." >&2
+  header "🔄 ОБНОВЛЕНИЕ" >&2
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Обновление пропущено: git reset --hard + docker compose пересборка бота/кабинета/caddy не выполняются" >&2
+    return 0
+  fi
+  info "Запуск..." >&2
   CUSTOM_TMP="/tmp/bedolaga-custom-$(date +%s)"
   mkdir -p "$CUSTOM_TMP"
 
@@ -811,6 +840,10 @@ show_report() {
 # ===== ВОССТАНОВЛЕНИЕ =====
 do_restore() {
   header "🔁 ВОССТАНОВЛЕНИЕ ИЗ БЭКАПА" >&2
+  if [ "$DRY_RUN" = true ]; then
+    warn "[dry-run] Восстановление недоступно в режиме --dry-run (это разрушающая операция). Запустите без --dry-run." >&2
+    return 0
+  fi
 
   local BACKUP_BASE="/root/bedolaga-local-backups"
   local BACKUPS=()
@@ -897,6 +930,7 @@ do_restore() {
 }
 
 # ===== ЦИКЛ =====
+[ "$DRY_RUN" = true ] && header "🧪 РЕЖИМ DRY-RUN — реальные изменения НЕ выполняются (scp/ssh/rm/docker/git/telegram)" >&2
 GLOBAL_EXIT=0
 case $ACT in
   1) do_backup || GLOBAL_EXIT=1 ;;
