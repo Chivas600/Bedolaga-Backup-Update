@@ -871,7 +871,10 @@ do_settings() {
 }
 
 # ===== ЗАГОЛОВОК И МЕНЮ =====
-if [ "$CRON_MODE" = true ]; then
+if [ "$VERIFY_RESTORE" = true ]; then
+  log "🚀 Запуск (--verify-restore)"
+  ACT=0
+elif [ "$CRON_MODE" = true ]; then
   log "🚀 Запуск (cron)"
   ACT=1
 else
@@ -1319,6 +1322,106 @@ show_report() {
   fi
 }
 
+# ===== СКАЧИВАНИЕ БЭКАПА С УДАЛЁННОГО ИСТОЧНИКА (SSH/S3) =====
+FETCHED_TMP=""
+fetch_remote_backup() {
+  local SRC="$1" NAMES=() NAME
+  if [ "$SRC" = ssh ]; then
+    [ -z "$BACKUP_SERVER" ] && { error "SSH-сервер не настроен" >&2; return 1; }
+    local SSH="ssh -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
+    mapfile -t NAMES < <($SSH "ls -1d ${BACKUP_REMOTE_DIR}/bedolaga-full-backup-* 2>/dev/null" 2>/dev/null | while read -r p; do basename "$p"; done | sort)
+  else
+    { [ -z "$RCLONE_REMOTE" ] || [ -z "$S3_BUCKET" ]; } && { error "S3 не настроен" >&2; return 1; }
+    mapfile -t NAMES < <(rclone lsf --dirs-only "${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}" 2>/dev/null | sed 's#/$##' | grep '^bedolaga-full-backup-' | sort)
+  fi
+  [ ${#NAMES[@]} -eq 0 ] && { error "На источнике ($SRC) бэкапов не найдено" >&2; return 1; }
+  info "Доступные бэкапы на источнике ($SRC):" >&2
+  local i; for i in "${!NAMES[@]}"; do echo "  $((i+1))) ${NAMES[$i]}" >&2; done
+  local SEL; read -p "Выбор [1-${#NAMES[@]}]: " SEL >&2
+  { [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le ${#NAMES[@]} ]; } || { error "Неверный выбор" >&2; return 1; }
+  NAME="${NAMES[$((SEL-1))]}"
+  FETCHED_TMP=$(mktemp -d "/tmp/bedolaga-fetch-XXXXXX")
+  info "Скачивание $NAME..." >&2
+  if [ "$SRC" = ssh ]; then
+    scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/${NAME}" "$FETCHED_TMP/" >&2 \
+      || { error "scp: не удалось скачать" >&2; return 1; }
+  else
+    rclone copy "${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/${NAME}" "$FETCHED_TMP/${NAME}" >&2 \
+      || { error "rclone: не удалось скачать" >&2; return 1; }
+  fi
+  success "Скачано во временную папку ✅" >&2
+  echo "$FETCHED_TMP/$NAME"
+}
+
+# ===== SELF-TEST ВОССТАНОВЛЕНИЯ (--verify-restore) =====
+do_verify_restore() {
+  header "🔎 ПРОВЕРКА ВОССТАНОВЛЕНИЯ (self-test, без стенда)" >&2
+  local BASE="/root/bedolaga-local-backups" BD RC=0
+  BD=$(find "$BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort | tail -1)
+  [ -z "$BD" ] && { error "Нет локальных бэкапов для проверки" >&2; return 1; }
+  info "Проверяем последний бэкап: $(basename "$BD")" >&2
+
+  # --- Уровень 1: целостность файлов ---
+  if [ -f "$BD/SHA256SUMS" ]; then
+    ( cd "$BD" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) && success "SHA256: ✅" >&2 || { error "SHA256: ❌" >&2; RC=1; }
+  fi
+  local ENCRYPTED=false; ls "$BD"/*.tar.zst.age >/dev/null 2>&1 && ENCRYPTED=true
+  local KEYFILE=""
+  if [ "$ENCRYPTED" = true ]; then
+    KEYFILE=$(obtain_age_key) || { error "Нет ключа — проверка зашифрованного бэкапа невозможна" >&2; return 1; }
+  fi
+  local TMP; TMP=$(mktemp -d) A GOTDUMP=""
+  for A in "$BD"/bot-*.tar.zst*; do
+    [ -e "$A" ] || continue
+    if [ "$ENCRYPTED" = true ]; then
+      age -d -i "$KEYFILE" "$A" 2>/dev/null | zstd -dc 2>/dev/null | tar -x -C "$TMP" 2>/dev/null \
+        && success "bot: расшифровка+распаковка ✅" >&2 || { error "bot: расшифровка/распаковка ❌" >&2; RC=1; }
+    else
+      zstd -tq "$A" 2>/dev/null && zstd -dc "$A" 2>/dev/null | tar -x -C "$TMP" 2>/dev/null \
+        && success "bot: целостность+распаковка ✅" >&2 || { error "bot: распаковка ❌" >&2; RC=1; }
+    fi
+  done
+  [ -f "$TMP/bot/postgres.dump" ] && GOTDUMP="$TMP/bot/postgres.dump"
+  # обратная совместимость: v2 (россыпь) — дамп лежит прямо в бэкапе
+  [ -z "$GOTDUMP" ] && [ -f "$BD/bot/postgres.dump" ] && { GOTDUMP="$BD/bot/postgres.dump"; info "Формат v2: дамп взят напрямую" >&2; }
+  detect_pg_credentials
+  if [ -n "$GOTDUMP" ]; then
+    docker exec -i "$PG_CONTAINER" pg_restore --list < "$GOTDUMP" >/dev/null 2>&1 \
+      && success "pg_restore --list: дамп валиден ✅" >&2 || { error "pg_restore --list: дамп повреждён ❌" >&2; RC=1; }
+  else
+    warn "Дамп бота не найден (возможно scope=cabinet) — уровень 2 пропущен" >&2
+  fi
+
+  # --- Уровень 2: восстановление в ОДНОРАЗОВЫЙ контейнер (боевую БД не трогаем) ---
+  if [ -n "$GOTDUMP" ]; then
+    info "Уровень 2: pg_restore в изолированный тест-контейнер..." >&2
+    local CN="bedolaga_restoretest_$$"
+    docker rm -f "$CN" >/dev/null 2>&1 || true
+    if docker run -d --name "$CN" -e POSTGRES_PASSWORD=verifytest -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" postgres:15-alpine >/dev/null 2>&1; then
+      local i; for i in $(seq 1 30); do docker exec "$CN" pg_isready -U "$PG_USER" >/dev/null 2>&1 && break; sleep 1; done
+      # pg_restore выдаёт варнинги (роли/расширения) и код !=0 даже при успехе —
+      # критерий успеха: в public появились таблицы, а не exit-код.
+      docker exec -i "$CN" pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists < "$GOTDUMP" >/dev/null 2>&1 || true
+      local TBLS; TBLS=$(docker exec "$CN" psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null | xargs)
+      if [ -n "$TBLS" ] && [ "$TBLS" -gt 0 ] 2>/dev/null; then
+        success "Восстановление в тест-контейнер ✅ (таблиц public: $TBLS)" >&2
+      else
+        error "pg_restore в тест-контейнер: таблицы не создались ❌" >&2; RC=1
+      fi
+      docker rm -f "$CN" >/dev/null 2>&1 && success "Тест-контейнер удалён ✅" >&2 || true
+    else
+      warn "Не удалось поднять тест-контейнер — уровень 2 пропущен" >&2
+    fi
+  fi
+
+  rm -rf "$TMP"; [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"
+  if [ "$RC" -eq 0 ]; then success "✅ Проверка восстановления ПРОЙДЕНА" >&2; else error "❌ Проверка выявила проблемы" >&2; fi
+  send_telegram "🔎 <b>Bedolaga verify-restore</b> — $(date '+%Y-%m-%d %H:%M')
+Бэкап: $(basename "$BD")
+Итог: $([ "$RC" -eq 0 ] && echo '✅ OK' || echo '❌ проблемы — см. лог')"
+  return $RC
+}
+
 # ===== ВОССТАНОВЛЕНИЕ =====
 do_restore() {
   header "🔁 ВОССТАНОВЛЕНИЕ ИЗ БЭКАПА" >&2
@@ -1327,26 +1430,38 @@ do_restore() {
     return 0
   fi
 
-  local BACKUP_BASE="/root/bedolaga-local-backups"
-  local BACKUPS=()
-  while IFS= read -r d; do BACKUPS+=("$d"); done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort)
+  # Выбор источника бэкапа: локально / SSH / S3
+  echo "Откуда восстанавливаем?" >&2
+  echo "  1) Локально (/root/bedolaga-local-backups)" >&2
+  echo "  2) SSH-сервер (${BACKUP_USER:-?}@${BACKUP_SERVER:-не задан})" >&2
+  echo "  3) S3 (${RCLONE_REMOTE:+${RCLONE_REMOTE}:${S3_BUCKET}})" >&2
+  read -p "Выбор [1-3, по умолчанию 1]: " RSRC >&2
 
-  if [ ${#BACKUPS[@]} -eq 0 ]; then
-    error "Локальных бэкапов не найдено в $BACKUP_BASE" >&2; return 1
-  fi
-
-  info "Доступные бэкапы:" >&2
-  for i in "${!BACKUPS[@]}"; do
-    local SZ; SZ=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | awk '{print $1}')
-    local DT; DT=$(basename "${BACKUPS[$i]}" | sed 's/bedolaga-full-backup-//')
-    echo "  $((i+1))) $DT  ($SZ)" >&2
-  done
-  echo "" >&2
-  read -p "📌 Выберите номер бэкапа [1-${#BACKUPS[@]}]: " SEL >&2
-  if [[ ! "$SEL" =~ ^[0-9]+$ ]] || [ "$SEL" -lt 1 ] || [ "$SEL" -gt "${#BACKUPS[@]}" ]; then
-    error "Неверный выбор" >&2; return 1
-  fi
-  local BD="${BACKUPS[$((SEL-1))]}"
+  local BD
+  case "$RSRC" in
+    2) BD=$(fetch_remote_backup ssh) || return 1 ;;
+    3) BD=$(fetch_remote_backup s3)  || return 1 ;;
+    *)
+      local BACKUP_BASE="/root/bedolaga-local-backups"
+      local BACKUPS=()
+      while IFS= read -r d; do BACKUPS+=("$d"); done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort)
+      if [ ${#BACKUPS[@]} -eq 0 ]; then
+        error "Локальных бэкапов не найдено в $BACKUP_BASE" >&2; return 1
+      fi
+      info "Доступные бэкапы:" >&2
+      for i in "${!BACKUPS[@]}"; do
+        local SZ; SZ=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | awk '{print $1}')
+        local DT; DT=$(basename "${BACKUPS[$i]}" | sed 's/bedolaga-full-backup-//')
+        echo "  $((i+1))) $DT  ($SZ)" >&2
+      done
+      echo "" >&2
+      read -p "📌 Выберите номер бэкапа [1-${#BACKUPS[@]}]: " SEL >&2
+      if [[ ! "$SEL" =~ ^[0-9]+$ ]] || [ "$SEL" -lt 1 ] || [ "$SEL" -gt "${#BACKUPS[@]}" ]; then
+        error "Неверный выбор" >&2; return 1
+      fi
+      BD="${BACKUPS[$((SEL-1))]}"
+      ;;
+  esac
   info "Выбран: $(basename "$BD")" >&2
 
   echo "" >&2
@@ -1448,6 +1563,7 @@ do_restore() {
 
   [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
   [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"
+  [ -n "$FETCHED_TMP" ] && rm -rf "$FETCHED_TMP"
   log "✅ Восстановление завершено"
 }
 
@@ -1458,6 +1574,13 @@ if ! flock -n 9; then
   warn "Другой экземпляр bedolaga-update уже выполняется — пропуск этого запуска." >&2
   log "⏭ Пропуск: параллельный запуск заблокирован flock" 2>/dev/null || true
   exit 0
+fi
+
+# ===== SELF-TEST (--verify-restore) — отдельный режим, минуя обычный цикл =====
+if [ "$VERIFY_RESTORE" = true ]; then
+  do_verify_restore; VR=$?
+  show_report "$VR"
+  exit $VR
 fi
 
 # ===== ЦИКЛ =====
