@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.0"
+VERSION="3.0.1"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -559,12 +559,12 @@ TXT
   read -p "Сгенерировать ключ и включить шифрование? [y/N]: " GO >&2
   [[ "$GO" =~ ^[Yy]$ ]] || { info "Отмена" >&2; return 0; }
 
-  local KT; KT=$(mktemp)
-  age-keygen -o "$KT" 2>/dev/null
-  local PUB PRIV
-  PUB=$(grep 'public key:' "$KT" | sed 's/.*public key: //' | xargs)
-  PRIV=$(grep '^AGE-SECRET-KEY-' "$KT" | xargs)
-  if [ -z "$PUB" ] || [ -z "$PRIV" ]; then error "Не удалось сгенерировать ключ ❌" >&2; rm -f "$KT"; return 1; fi
+  # Генерируем в stdout: age-keygen -o отказывается писать в уже существующий файл (mktemp его создаёт)
+  local KGEN PUB PRIV
+  KGEN=$(age-keygen 2>/dev/null)
+  PUB=$(printf '%s\n' "$KGEN" | grep 'public key:' | sed 's/.*public key: //' | head -1 | xargs)
+  PRIV=$(printf '%s\n' "$KGEN" | grep '^AGE-SECRET-KEY-' | head -1 | xargs)
+  if [ -z "$PUB" ] || [ -z "$PRIV" ]; then error "Не удалось сгенерировать ключ ❌" >&2; return 1; fi
 
   echo "" >&2
   echo -e "\033[1;31m╔═══════════════════════════════════════════════════════════════╗\033[0m" >&2
@@ -611,7 +611,7 @@ TXT
   done
   if [ "$OK" != true ]; then
     error "Не подтверждено. Шифрование НЕ включено, ключ отброшен (сгенерируйте заново позже)." >&2
-    rm -f "$KT"; return 1
+    return 1
   fi
 
   AGE_RECIPIENT="$PUB"; ENCRYPT=true
@@ -621,12 +621,11 @@ TXT
   warn "сервера злоумышленник сможет расшифровать бэкапы. Рекомендация: НЕ хранить." >&2
   read -p "Сохранить приватный ключ на сервере (для авто-восстановления здесь же)? [y/N]: " KEEP >&2
   if [[ "$KEEP" =~ ^[Yy]$ ]]; then
-    AGE_KEY_FILE="/root/.bedolaga-age.key"; cp "$KT" "$AGE_KEY_FILE"; chmod 600 "$AGE_KEY_FILE"
+    AGE_KEY_FILE="/root/.bedolaga-age.key"; printf '%s\n' "$KGEN" > "$AGE_KEY_FILE"; chmod 600 "$AGE_KEY_FILE"
     warn "Ключ сохранён в $AGE_KEY_FILE (chmod 600). Всё равно держите копию у себя!" >&2
   else
     AGE_KEY_FILE=""; info "Приватный ключ на сервере не хранится — только у вас." >&2
   fi
-  rm -f "$KT"
   save_all_config
   success "Шифрование включено ✅ (offsite-копии будут .tar.zst.age)" >&2
 }
