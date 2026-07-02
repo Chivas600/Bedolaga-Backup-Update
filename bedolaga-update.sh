@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.2"
+VERSION="3.0.3"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -37,6 +37,13 @@ guard() {
   fi
   "$@"
 }
+
+# ===== НОРМАЛИЗАЦИЯ ВВОДА =====
+# Убирает пробелы и управляющие символы (в т.ч. \r от CRLF-клиентов SSH),
+# из-за которых ответы вида "y" не совпадали с ^[Yy]$.
+trim_input() { printf '%s' "$1" | tr -d '[:space:]'; }
+# _yes ОТВЕТ -> 0, если это y/yes (без учёта регистра и мусора)
+_yes() { [[ "$(trim_input "$1")" =~ ^[Yy]([Ee][Ss])?$ ]]; }
 
 # ===== ВЫБОР КОМПОНЕНТОВ (бот / кабинет / всё) =====
 # ROLE  — что физически есть на этом хосте (all|bot|cabinet); для разнесённых инстансов.
@@ -105,7 +112,7 @@ prompt_path() {
   if [ -n "$FOUND" ]; then
     info "Найден путь к $LABEL: $FOUND" >&2
     read -p "✅ Использовать? [y/N]: " CONFIRM >&2
-    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then PROMPT_PATH_RESULT="$FOUND"; return 0; fi
+    if _yes "$CONFIRM"; then PROMPT_PATH_RESULT="$FOUND"; return 0; fi
   fi
 
   local CANDIDATES=()
@@ -212,7 +219,7 @@ detect_paths() {
     if [ -n "$FOUND_CADDY" ]; then
       info "Найден путь к Caddy: $FOUND_CADDY" >&2
       read -p "✅ Использовать? [y/N]: " CC >&2
-      [[ "$CC" =~ ^[Yy]$ ]] && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
+      _yes "$CC" && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
     else
       info "Caddy не найден. Введите путь или Enter для пропуска" >&2
       read -p "📁 Путь к Caddy: " CADDY_DIR >&2
@@ -588,10 +595,10 @@ TXT
   if [ -n "$AGE_RECIPIENT" ]; then
     warn "Уже настроен публичный ключ: $AGE_RECIPIENT" >&2
     read -p "Сгенерировать НОВЫЙ ключ? Старые зашифрованные бэкапы станут нечитаемы новым ключом [y/N]: " RG >&2
-    [[ "$RG" =~ ^[Yy]$ ]] || { info "Оставляю текущий ключ" >&2; return 0; }
+    _yes "$RG" || { info "Оставляю текущий ключ" >&2; return 0; }
   fi
   read -p "Сгенерировать ключ и включить шифрование? [y/N]: " GO >&2
-  [[ "$GO" =~ ^[Yy]$ ]] || { info "Отмена" >&2; return 0; }
+  _yes "$GO" || { info "Отмена" >&2; return 0; }
 
   # Генерируем в stdout: age-keygen -o отказывается писать в уже существующий файл (mktemp его создаёт)
   local KGEN PUB PRIV
@@ -618,7 +625,7 @@ TXT
 
   if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
     read -p "Прислать в Telegram уведомление (ключ будет ЗАМАСКИРОВАН)? [y/N]: " TS >&2
-    if [[ "$TS" =~ ^[Yy]$ ]]; then
+    if _yes "$TS"; then
       local MASKED; MASKED=$(mask_secret "$PRIV")
       if tg_send_selfdestruct "🔐 <b>Bedolaga — age-ключ бэкапов создан</b>
 
@@ -643,7 +650,7 @@ TXT
   echo "" >&2
   for TRY in 1 2 3; do
     read -p "Подтвердите сохранение: введите ПОСЛЕДНИЕ 8 символов приватного ключа: " CONF >&2
-    CONF="$(echo "$CONF" | xargs)"
+    CONF="$(trim_input "$CONF")"
     if [ "$CONF" = "$TAIL" ]; then OK=true; break; fi
     warn "Не совпало (попытка $TRY/3). Точно сохранили ключ?" >&2
   done
@@ -658,7 +665,7 @@ TXT
   warn "Хранение приватного ключа на СЕРВЕРЕ упрощает восстановление, но при взломе" >&2
   warn "сервера злоумышленник сможет расшифровать бэкапы. Рекомендация: НЕ хранить." >&2
   read -p "Сохранить приватный ключ на сервере (для авто-восстановления здесь же)? [y/N]: " KEEP >&2
-  if [[ "$KEEP" =~ ^[Yy]$ ]]; then
+  if _yes "$KEEP"; then
     AGE_KEY_FILE="/root/.bedolaga-age.key"; printf '%s\n' "$KGEN" > "$AGE_KEY_FILE"; chmod 600 "$AGE_KEY_FILE"
     warn "Ключ сохранён в $AGE_KEY_FILE (chmod 600). Всё равно держите копию у себя!" >&2
   else
@@ -748,7 +755,7 @@ if [ "$NEED_FULL_SETUP" = true ]; then
   read -p "🧵 Telegram Topic ID (Enter для пропуска): " TG_THREAD_ID >&2
   echo "" >&2
   read -p "💾 Сохранить ВСЕ настройки? [y/N]: " SAVE_ALL >&2
-  if [[ "$SAVE_ALL" =~ ^[Yy]$ ]]; then save_all_config; fi
+  if _yes "$SAVE_ALL"; then save_all_config; fi
 fi
 
 REPORT_FILE="/root/bedolaga-report-$(date +%Y%m%d-%H%M).txt"
@@ -1504,13 +1511,13 @@ do_restore() {
 
   echo "" >&2
   read -p "⚠️  Восстановление ПЕРЕЗАПИШЕТ текущие данные. Продолжить? [y/N]: " C1 >&2
-  [[ "$C1" =~ ^[Yy]$ ]] || { info "Отменено" >&2; return 0; }
+  _yes "$C1" || { info "Отменено" >&2; return 0; }
 
   read -p "⚠️  Папки бота и кабинета будут перезаписаны. Вы уверены? [y/N]: " C2 >&2
-  [[ "$C2" =~ ^[Yy]$ ]] || { info "Отменено" >&2; return 0; }
+  _yes "$C2" || { info "Отменено" >&2; return 0; }
 
   read -p "⚠️  ПОСЛЕДНИЙ ШАНС. Введите слово RESTORE для подтверждения: " C3 >&2
-  [ "$C3" = "RESTORE" ] || { info "Отменено" >&2; return 0; }
+  [ "$(trim_input "$C3")" = "RESTORE" ] || { info "Отменено" >&2; return 0; }
 
   log "🔁 Начало восстановления из $(basename "$BD")"
 
@@ -1526,7 +1533,7 @@ do_restore() {
       else
         error "SHA256: контрольные суммы НЕ совпали — архив повреждён ❌" >&2
         read -p "Всё равно продолжить восстановление? [y/N]: " CX >&2
-        [[ "$CX" =~ ^[Yy]$ ]] || { info "Отменено" >&2; return 1; }
+        _yes "$CX" || { info "Отменено" >&2; return 1; }
       fi
     fi
     local KEYFILE=""
@@ -1630,7 +1637,7 @@ case $ACT in
   3) do_backup || GLOBAL_EXIT=1
      if [ $GLOBAL_EXIT -eq 0 ]; then
        echo "" >&2; read -p "✅ Бэкап готов. Обновить? [y/N]: " C >&2
-       if [[ "$C" =~ ^[Yy]$ ]]; then do_update || GLOBAL_EXIT=1; else info "Обновление отменено" >&2; fi
+       if _yes "$C"; then do_update || GLOBAL_EXIT=1; else info "Обновление отменено" >&2; fi
      fi
      ;;
   5) do_restore || GLOBAL_EXIT=1 ;;
