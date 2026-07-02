@@ -282,6 +282,9 @@ DEST_TELEGRAM="$DEST_TELEGRAM"
 RCLONE_REMOTE="$RCLONE_REMOTE"
 S3_BUCKET="$S3_BUCKET"
 S3_PREFIX="$S3_PREFIX"
+ENCRYPT="$ENCRYPT"
+AGE_RECIPIENT="$AGE_RECIPIENT"
+AGE_KEY_FILE="$AGE_KEY_FILE"
 CONF
   chmod 600 "$CONFIG_FILE"
   success "Все настройки сохранены ✅" >&2
@@ -520,6 +523,113 @@ configure_destinations() {
   save_all_config
 }
 
+# ===== ПОЛУЧЕНИЕ ПРИВАТНОГО AGE-КЛЮЧА ДЛЯ РАСШИФРОВКИ =====
+AGE_KEY_TMP=""
+obtain_age_key() {
+  # Печатает путь к файлу с приватным ключом (или пусто при неудаче)
+  if [ -n "$AGE_KEY_FILE" ] && [ -f "$AGE_KEY_FILE" ]; then
+    echo "$AGE_KEY_FILE"; return 0
+  fi
+  warn "Нужен приватный age-ключ — на сервере он не хранится." >&2
+  info "Вставьте строку ключа (AGE-SECRET-KEY-1...) и нажмите Enter:" >&2
+  local K; read -r K >&2
+  K="$(echo "$K" | xargs)"
+  [ -z "$K" ] && { error "Ключ не введён" >&2; return 1; }
+  AGE_KEY_TMP=$(mktemp); printf '%s\n' "$K" > "$AGE_KEY_TMP"; chmod 600 "$AGE_KEY_TMP"
+  echo "$AGE_KEY_TMP"; return 0
+}
+
+# ===== ОНБОРДИНГ ШИФРОВАНИЯ (age): понятная генерация и сохранение ключа =====
+setup_encryption() {
+  header "🔐 ШИФРОВАНИЕ БЭКАПОВ (age)" >&2
+  cat >&2 <<'TXT'
+Бэкапы содержат .env с паролями БД, токенами бота и SMTP. Перед отправкой в
+Telegram/S3 их обязательно шифровать. Используется age — простая пара ключей:
+  • ПУБЛИЧНЫЙ ключ  — шифрует, хранится на сервере (не секрет).
+  • ПРИВАТНЫЙ ключ  — расшифровывает, храните ТОЛЬКО ВЫ.
+⚠️ Без приватного ключа зашифрованный бэкап восстановить НЕВОЗМОЖНО.
+TXT
+  echo "" >&2
+  if [ -n "$AGE_RECIPIENT" ]; then
+    warn "Уже настроен публичный ключ: $AGE_RECIPIENT" >&2
+    read -p "Сгенерировать НОВЫЙ ключ? Старые зашифрованные бэкапы станут нечитаемы новым ключом [y/N]: " RG >&2
+    [[ "$RG" =~ ^[Yy]$ ]] || { info "Оставляю текущий ключ" >&2; return 0; }
+  fi
+  read -p "Сгенерировать ключ и включить шифрование? [y/N]: " GO >&2
+  [[ "$GO" =~ ^[Yy]$ ]] || { info "Отмена" >&2; return 0; }
+
+  local KT; KT=$(mktemp)
+  age-keygen -o "$KT" 2>/dev/null
+  local PUB PRIV
+  PUB=$(grep 'public key:' "$KT" | sed 's/.*public key: //' | xargs)
+  PRIV=$(grep '^AGE-SECRET-KEY-' "$KT" | xargs)
+  if [ -z "$PUB" ] || [ -z "$PRIV" ]; then error "Не удалось сгенерировать ключ ❌" >&2; rm -f "$KT"; return 1; fi
+
+  echo "" >&2
+  echo -e "\033[1;31m╔═══════════════════════════════════════════════════════════════╗\033[0m" >&2
+  echo -e "\033[1;31m║  ⚠️  СОХРАНИТЕ ЭТОТ ПРИВАТНЫЙ КЛЮЧ ПРЯМО СЕЙЧАС               ║\033[0m" >&2
+  echo -e "\033[1;31m║  Без него вы НЕ восстановите зашифрованные бэкапы.            ║\033[0m" >&2
+  echo -e "\033[1;31m╚═══════════════════════════════════════════════════════════════╝\033[0m" >&2
+  echo "" >&2
+  echo "  🔑 ПРИВАТНЫЙ КЛЮЧ (секрет — в менеджер паролей):" >&2
+  echo -e "\033[1;33m      $PRIV\033[0m" >&2
+  echo "" >&2
+  echo "  🔓 Публичный ключ (не секрет, идёт в конфиг):" >&2
+  echo "      $PUB" >&2
+  echo "" >&2
+  echo "  Что сделать: 1) скопируйте приватный ключ  2) сохраните в надёжном месте" >&2
+  echo "               3) при восстановлении вставите его обратно — и всё заработает" >&2
+  echo "" >&2
+
+  if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+    read -p "Прислать ключ и инструкцию в Telegram (личный чат)? [y/N]: " TS >&2
+    if [[ "$TS" =~ ^[Yy]$ ]]; then
+      send_telegram "🔐 <b>Bedolaga — приватный age-ключ для бэкапов</b>
+
+⚠️ <b>СОХРАНИТЕ</b> этот ключ (менеджер паролей) и затем <b>УДАЛИТЕ</b> это сообщение.
+Без него зашифрованные бэкапы восстановить НЕВОЗМОЖНО.
+
+🔑 <b>Приватный ключ:</b>
+<code>${PRIV}</code>
+
+🔓 Публичный ключ: <code>${PUB}</code>
+
+<b>Как восстановить:</b> bedolaga-update → «5) Восстановление» → при запросе вставьте этот ключ."
+      success "Отправлено в Telegram. Сохраните и удалите сообщение!" >&2
+    fi
+  fi
+
+  # Гейт подтверждения: пользователь вводит последние 8 символов ключа
+  local TAIL="${PRIV: -8}" OK=false TRY CONF
+  echo "" >&2
+  for TRY in 1 2 3; do
+    read -p "Подтвердите сохранение: введите ПОСЛЕДНИЕ 8 символов приватного ключа: " CONF >&2
+    CONF="$(echo "$CONF" | xargs)"
+    if [ "$CONF" = "$TAIL" ]; then OK=true; break; fi
+    warn "Не совпало (попытка $TRY/3). Точно сохранили ключ?" >&2
+  done
+  if [ "$OK" != true ]; then
+    error "Не подтверждено. Шифрование НЕ включено, ключ отброшен (сгенерируйте заново позже)." >&2
+    rm -f "$KT"; return 1
+  fi
+
+  AGE_RECIPIENT="$PUB"; ENCRYPT=true
+
+  echo "" >&2
+  warn "Хранение приватного ключа на СЕРВЕРЕ упрощает восстановление, но при взломе" >&2
+  warn "сервера злоумышленник сможет расшифровать бэкапы. Рекомендация: НЕ хранить." >&2
+  read -p "Сохранить приватный ключ на сервере (для авто-восстановления здесь же)? [y/N]: " KEEP >&2
+  if [[ "$KEEP" =~ ^[Yy]$ ]]; then
+    AGE_KEY_FILE="/root/.bedolaga-age.key"; cp "$KT" "$AGE_KEY_FILE"; chmod 600 "$AGE_KEY_FILE"
+    warn "Ключ сохранён в $AGE_KEY_FILE (chmod 600). Всё равно держите копию у себя!" >&2
+  else
+    AGE_KEY_FILE=""; info "Приватный ключ на сервере не хранится — только у вас." >&2
+  fi
+  rm -f "$KT"
+  save_all_config
+  success "Шифрование включено ✅ (offsite-копии будут .tar.zst.age)" >&2
+}
+
 # ===== ЗАГРУЗКА ИЛИ СОЗДАНИЕ КОНФИГА =====
 NEED_FULL_SETUP=false
 
@@ -550,6 +660,11 @@ DEST_TELEGRAM="${DEST_TELEGRAM:-false}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 S3_BUCKET="${S3_BUCKET:-}"
 S3_PREFIX="${S3_PREFIX:-bedolaga-backups}"
+
+# Шифрование (age): при ENCRYPT=true все копии (локальные и offsite) шифруются
+ENCRYPT="${ENCRYPT:-false}"
+AGE_RECIPIENT="${AGE_RECIPIENT:-}"
+AGE_KEY_FILE="${AGE_KEY_FILE:-}"
 
 # Валидация --only и предварительное разрешение SCOPE (для cron/неинтерактивного режима)
 if [ -n "$ONLY" ]; then
@@ -630,8 +745,9 @@ do_settings() {
   echo "6) Кастомные файлы (защита при обновлении)" >&2
   echo "7) Назначения бэкапов (SSH, S3, Telegram-файлы)" >&2
   echo "8) Роль сервера (всё / только бот / только кабинет)" >&2
-  read -p "Выбор [1-8]: " SACT >&2
-  [[ ! "$SACT" =~ ^[1-8]$ ]] && { error "Неверный выбор" >&2; return 1; }
+  echo "9) Шифрование age (генерация ключа, вкл/выкл)" >&2
+  read -p "Выбор [1-9]: " SACT >&2
+  [[ ! "$SACT" =~ ^[1-9]$ ]] && { error "Неверный выбор" >&2; return 1; }
 
   case "$SACT" in
     1)
@@ -713,6 +829,18 @@ do_settings() {
       read -p "Выбор [1-3]: " RSEL >&2
       case "$RSEL" in 2) ROLE="bot";; 3) ROLE="cabinet";; 1) ROLE="all";; *) error "Отмена" >&2; return 1;; esac
       success "Роль: $ROLE" >&2; save_all_config
+      ;;
+    9)
+      echo "" >&2
+      info "Шифрование: ${ENCRYPT:-false}$( [ -n "$AGE_RECIPIENT" ] && echo " (ключ: $AGE_RECIPIENT)")" >&2
+      echo "  1) Настроить/сгенерировать ключ (включить)" >&2
+      echo "  2) Выключить шифрование" >&2
+      read -p "Выбор [1-2]: " ES >&2
+      case "$ES" in
+        1) setup_encryption ;;
+        2) ENCRYPT=false; save_all_config; success "Шифрование выключено (ключ в конфиге сохранён)" >&2 ;;
+        *) info "Отмена" >&2 ;;
+      esac
       ;;
   esac
 }
@@ -876,8 +1004,27 @@ do_backup() {
     fi
   done
 
-  # ---- Манифест + контрольные суммы ----
-  ( cd "$BD" && sha256sum *.tar.zst > SHA256SUMS 2>/dev/null ) || true
+  # ---- Шифрование (age) перед контрольными суммами и отправкой offsite ----
+  local ENC_STATE="false"
+  if [ "${ENCRYPT:-false}" = "true" ] && [ -n "$AGE_RECIPIENT" ]; then
+    header "🔐 ШИФРОВАНИЕ (age)" >&2
+    local Z
+    for Z in "$BD"/*.tar.zst; do
+      [ -e "$Z" ] || continue
+      if guard age -r "$AGE_RECIPIENT" -o "$Z.age" "$Z"; then
+        [ "$DRY_RUN" = true ] || rm -f "$Z"
+        success "🔐 $(basename "$Z").age ✅" >&2
+      else
+        error "Шифрование $(basename "$Z") не удалось ❌" >&2; log "❌ age failed"; rm -rf "$STAGE"; return 1
+      fi
+    done
+    ENC_STATE="true"
+  elif [ "${ENCRYPT:-false}" = "true" ]; then
+    warn "ENCRYPT=true, но AGE_RECIPIENT пуст — шифрование ПРОПУЩЕНО! Настройте ключ (Настройки → 9)." >&2
+  fi
+
+  # ---- Манифест + контрольные суммы (по итоговому набору файлов) ----
+  ( cd "$BD" && sha256sum *.tar.zst* > SHA256SUMS 2>/dev/null ) || true
   {
     echo "bedolaga-backup-format: 3"
     echo "created: $(date '+%Y-%m-%d %H:%M:%S %z')"
@@ -885,9 +1032,10 @@ do_backup() {
     echo "role: ${ROLE:-all}"
     echo "scope: ${SCOPE:-all}"
     echo "host: $(hostname)"
+    echo "encrypted: $ENC_STATE"
     echo "pg_user: $PG_USER"
     echo "pg_db: $PG_DB"
-    echo "components:$(cd "$BD" && for f in *.tar.zst; do [ -e "$f" ] && printf ' %s' "${f%-$TS.tar.zst}"; done)"
+    echo "components:$(cd "$BD" && for f in *.tar.zst *.tar.zst.age; do [ -e "$f" ] && printf ' %s' "$(basename "$f" | sed "s/-$TS\.tar\.zst\(\.age\)\?//")"; done)"
   } > "$BD/manifest.txt"
   success "Манифест и SHA256SUMS записаны ✅" >&2
   rm -rf "$STAGE"
@@ -906,12 +1054,13 @@ do_backup() {
     [ "$ELAPSED" -ge 60 ] && ELAPSED_FMT="$((ELAPSED/60))м $((ELAPSED%60))с" || ELAPSED_FMT="${ELAPSED}с"
 
     local FILES_INFO="" FSZ ARCH
-    for ARCH in "$BD"/*.tar.zst; do
+    for ARCH in "$BD"/*.tar.zst*; do
       [ -e "$ARCH" ] || continue
       FSZ=$(ls -lh "$ARCH" | awk '{print $5}')
       FILES_INFO="${FILES_INFO}  ✅ $(basename "$ARCH") (${FSZ})"$'\n'
     done
     [ -z "$FILES_INFO" ] && FILES_INFO="  ❌ архивы не созданы"$'\n'
+    [ "${ENCRYPT:-false}" = "true" ] && [ -n "$AGE_RECIPIENT" ] && FILES_INFO="${FILES_INFO}  🔐 зашифровано age"$'\n'
 
     local RAM_FREE; RAM_FREE=$(free -h | awk '/^Mem:/{print $7}')
     local DISK_FREE; DISK_FREE=$(df -h /root | awk 'NR==2{print $4}')
@@ -1187,10 +1336,12 @@ do_restore() {
 
   log "🔁 Начало восстановления из $(basename "$BD")"
 
-  # Определяем источник файлов: новый формат (компонентные архивы v3) или старый (россыпь v2)
-  local SRC SRC_TMP=""
-  if ls "$BD"/*.tar.zst >/dev/null 2>&1; then
-    info "Формат бэкапа: компонентные архивы (v3)" >&2
+  # Определяем источник файлов: новый формат (компонентные архивы v3, возможно .age) или старый (россыпь v2)
+  local SRC SRC_TMP="" ENCRYPTED=false
+  ls "$BD"/*.tar.zst.age >/dev/null 2>&1 && ENCRYPTED=true
+  if ls "$BD"/*.tar.zst* >/dev/null 2>&1; then
+    if [ "$ENCRYPTED" = true ]; then info "Формат бэкапа: компонентные архивы v3 🔐 (зашифровано age)" >&2
+    else info "Формат бэкапа: компонентные архивы v3" >&2; fi
     if [ -f "$BD/SHA256SUMS" ]; then
       if ( cd "$BD" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
         success "SHA256: контрольные суммы совпали ✅" >&2
@@ -1200,11 +1351,22 @@ do_restore() {
         [[ "$CX" =~ ^[Yy]$ ]] || { info "Отменено" >&2; return 1; }
       fi
     fi
+    local KEYFILE=""
+    if [ "$ENCRYPTED" = true ]; then
+      KEYFILE=$(obtain_age_key) || { error "Без приватного age-ключа зашифрованный бэкап восстановить нельзя." >&2; return 1; }
+    fi
     SRC_TMP=$(mktemp -d "/tmp/bedolaga-restore-XXXXXX"); SRC="$SRC_TMP"
     local A
-    for A in "$BD"/*.tar.zst; do
+    for A in "$BD"/*.tar.zst*; do
+      [ -e "$A" ] || continue
       info "Распаковка $(basename "$A")..." >&2
-      zstd -dc "$A" | tar -x -C "$SRC" || { error "Ошибка распаковки $(basename "$A") ❌" >&2; rm -rf "$SRC_TMP"; return 1; }
+      if [ "$ENCRYPTED" = true ]; then
+        age -d -i "$KEYFILE" "$A" 2>/dev/null | zstd -dc | tar -x -C "$SRC" \
+          || { error "Ошибка расшифровки/распаковки $(basename "$A") ❌ (неверный ключ?)" >&2; rm -rf "$SRC_TMP"; [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"; return 1; }
+      else
+        zstd -dc "$A" | tar -x -C "$SRC" \
+          || { error "Ошибка распаковки $(basename "$A") ❌" >&2; rm -rf "$SRC_TMP"; return 1; }
+      fi
     done
     success "Архивы распакованы ✅" >&2
   else
@@ -1260,6 +1422,7 @@ do_restore() {
 Проверьте контейнеры и работоспособность сервисов."
 
   [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
+  [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"
   log "✅ Восстановление завершено"
 }
 
