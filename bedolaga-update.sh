@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.4"
+VERSION="3.0.5"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1218,45 +1218,55 @@ do_update() {
   info "Запуск..." >&2
   CUSTOM_TMP="/tmp/bedolaga-custom-$(date +%s)"
   mkdir -p "$CUSTOM_TMP"
+  local UPDATE_RC=0
 
   if want_component bot; then
-  info "Бот..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; return 1; }
+  info "Бот..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; log "❌ Бот: папка не найдена"; return 1; }
   save_custom_files "$BOT_DIR" "bot"
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
   git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$BOT_DIR" "bot"
   docker compose down
-  docker compose up -d --build bot
+  if ! docker compose up -d --build bot; then error "Бот: пересборка контейнера упала ❌" >&2; log "❌ Бот: docker compose up --build не удался"; UPDATE_RC=1; fi
   sleep 10
-  if docker compose ps | grep -q "remnawave_bot.*(healthy)"; then success "Бот: healthy ✅" >&2; else warn "Бот: проверка ⚠️" >&2; docker compose logs --tail=20 bot||true; fi
+  if docker compose ps | grep -q "remnawave_bot.*(healthy)"; then success "Бот: healthy ✅" >&2; log "✅ Бот обновлён (healthy)"; else warn "Бот: не healthy после обновления ⚠️" >&2; log "⚠️ Бот: health-проверка не прошла"; docker compose logs --tail=20 bot||true; UPDATE_RC=1; fi
   else
     info "Бот: обновление пропущено (scope=$SCOPE, role=$ROLE)" >&2
   fi
 
   if want_component cabinet; then
-  info "Кабинет..." >&2; cd "$CABINET_DIR" || { error "Папка кабинета не найдена" >&2; return 1; }
+  info "Кабинет..." >&2; cd "$CABINET_DIR" || { error "Папка кабинета не найдена" >&2; log "❌ Кабинет: папка не найдена"; return 1; }
   save_custom_files "$CABINET_DIR" "cabinet"
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
   git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$CABINET_DIR" "cabinet"
-  npm install --silent
-  npm run build --silent
-  docker compose up -d --build cabinet-frontend
+  if ! npm install --silent 2>/tmp/bedolaga-cab-npm.log; then
+    error "Кабинет: npm install упал ❌" >&2; tail -n 12 /tmp/bedolaga-cab-npm.log | tee -a "$REPORT_FILE" >&2
+    log "❌ Кабинет: npm install не удался"; UPDATE_RC=1
+  fi
+  if ! npm run build --silent 2>/tmp/bedolaga-cab-build.log; then
+    error "Кабинет: npm run build упал ❌ — новая версия НЕ собрана" >&2; tail -n 15 /tmp/bedolaga-cab-build.log | tee -a "$REPORT_FILE" >&2
+    log "❌ Кабинет: npm run build не удался (новая версия НЕ задеплоена)"; UPDATE_RC=1
+  fi
+  if ! docker compose up -d --build cabinet-frontend; then error "Кабинет: пересборка контейнера упала ❌" >&2; log "❌ Кабинет: docker compose up --build не удался"; UPDATE_RC=1; fi
   sleep 15
-  if docker exec cabinet_frontend wget --no-verbose --tries=1 --spider http://127.0.0.1:80/ 2>&1 | grep -qE "200|exists|connected"; then success "Кабинет: healthy ✅" >&2; else warn "Кабинет: проверка ⚠️" >&2; docker compose logs --tail=30 cabinet-frontend||true; fi
+  if docker exec cabinet_frontend wget --no-verbose --tries=1 --spider http://127.0.0.1:80/ 2>&1 | grep -qE "200|exists|connected"; then success "Кабинет: healthy ✅" >&2; log "✅ Кабинет обновлён (отвечает)"; else warn "Кабинет: не отвечает после обновления ⚠️" >&2; log "⚠️ Кабинет: health-проверка не прошла"; docker compose logs --tail=30 cabinet-frontend||true; UPDATE_RC=1; fi
   else
     info "Кабинет: обновление пропущено (scope=$SCOPE, role=$ROLE)" >&2
   fi
 
   info "Caddy..." >&2
   if [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ]; then
-    cd "$CADDY_DIR" && docker compose down && docker compose up -d --build && success "Caddy ✅" >&2
+    cd "$CADDY_DIR" && docker compose down && docker compose up -d --build && success "Caddy ✅" >&2 || { warn "Caddy: пересборка не удалась ⚠️" >&2; log "⚠️ Caddy: пересборка не удалась"; }
   else
     docker restart remnawave_caddy 2>/dev/null && success "Caddy ✅" >&2 || info "Caddy: нет" >&2
   fi
 
   rm -rf "$CUSTOM_TMP"
-  log "Обновление завершено"; return 0
+  if [ "$UPDATE_RC" -ne 0 ]; then
+    error "Обновление завершено С ОШИБКАМИ ❌" >&2; log "❌ Обновление завершено С ОШИБКАМИ (см. лог выше)"; return 1
+  fi
+  log "Обновление завершено ✅"; return 0
 }
 
 # ===== ПРОВЕРКА SMTP =====
@@ -1615,7 +1625,8 @@ fi
 
 # ===== SELF-TEST (--verify-restore) — отдельный режим, минуя обычный цикл =====
 if [ "$VERIFY_RESTORE" = true ]; then
-  do_verify_restore; VR=$?
+  VR=0; do_verify_restore || VR=$?
+  trap - ERR   # результат уже в VR — снимаем safety-net, чтобы диагностика не дала ложный алерт
   show_report "$VR"
   exit $VR
 fi
@@ -1638,7 +1649,12 @@ esac
 # Гарантированное уведомление о сбое (закрывает «тихие» провалы бэкапа)
 if [ "$GLOBAL_EXIT" -ne 0 ]; then notify_failure "$GLOBAL_EXIT" "действие $ACT"; fi
 
+# Результат операции уже зафиксирован в GLOBAL_EXIT и, при сбое, отправлен.
+# Снимаем ERR-trap: дальше идёт только диагностика/отчёт, чьи ненулевые коды
+# (curl к поднимающемуся сервису, grep -q без совпадения) НЕ являются сбоем операции.
+trap - ERR
+
 rotate_reports
-do_check
+do_check || true
 show_report "$GLOBAL_EXIT"
 exit $GLOBAL_EXIT
