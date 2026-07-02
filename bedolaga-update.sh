@@ -714,7 +714,32 @@ if [ "$NEED_FULL_SETUP" = true ]; then
 fi
 
 REPORT_FILE="/root/bedolaga-report-$(date +%Y%m%d-%H%M).txt"
-log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a "$REPORT_FILE" >&2; }
+CURRENT_STEP=""
+log() { CURRENT_STEP="$1"; echo "[$(date '+%H:%M:%S')] $1" | tee -a "$REPORT_FILE" >&2; }
+
+# ===== АВАРИЙНЫЙ АЛЕРТ (гарантированное уведомление при сбое) =====
+FAILED_NOTIFIED=false
+notify_failure() {
+  local EC="$1" WHERE="$2"
+  [ "$FAILED_NOTIFIED" = true ] && return 0
+  FAILED_NOTIFIED=true
+  local TAIL; TAIL=$(tail -n 8 "$REPORT_FILE" 2>/dev/null)
+  send_telegram "❌ <b>Bedolaga: сбой операции</b> — $(date '+%Y-%m-%d %H:%M')
+Код: ${EC}${WHERE:+, место: $WHERE}
+Последний шаг: <code>${CURRENT_STEP:-?}</code>
+<b>Хвост лога:</b>
+<pre>${TAIL}</pre>"
+}
+on_error() { local ec=$?; notify_failure "$ec" "trap ERR"; }
+trap on_error ERR
+
+# ===== РОТАЦИЯ ФАЙЛОВ-ОТЧЁТОВ =====
+rotate_reports() {
+  local KEEP=30 F
+  ls -1t /root/bedolaga-report-*.txt 2>/dev/null | tail -n +$((KEEP+1)) | while read -r F; do
+    guard rm -f "$F"
+  done
+}
 
 check_backup_file() {
   local F="$1" N="$2"
@@ -1426,6 +1451,15 @@ do_restore() {
   log "✅ Восстановление завершено"
 }
 
+# ===== БЛОКИРОВКА (flock) — не даём двум запускам идти параллельно =====
+LOCK_FILE="/var/lock/bedolaga-backup.lock"
+exec 9>"$LOCK_FILE" 2>/dev/null || exec 9>"/tmp/bedolaga-backup.lock"
+if ! flock -n 9; then
+  warn "Другой экземпляр bedolaga-update уже выполняется — пропуск этого запуска." >&2
+  log "⏭ Пропуск: параллельный запуск заблокирован flock" 2>/dev/null || true
+  exit 0
+fi
+
 # ===== ЦИКЛ =====
 [ "$DRY_RUN" = true ] && header "🧪 РЕЖИМ DRY-RUN — реальные изменения НЕ выполняются (scp/ssh/rm/docker/git/telegram)" >&2
 GLOBAL_EXIT=0
@@ -1441,6 +1475,10 @@ case $ACT in
   5) do_restore || GLOBAL_EXIT=1 ;;
 esac
 
+# Гарантированное уведомление о сбое (закрывает «тихие» провалы бэкапа)
+if [ "$GLOBAL_EXIT" -ne 0 ]; then notify_failure "$GLOBAL_EXIT" "действие $ACT"; fi
+
+rotate_reports
 do_check
 show_report "$GLOBAL_EXIT"
 exit $GLOBAL_EXIT
