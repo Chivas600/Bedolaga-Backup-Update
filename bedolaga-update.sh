@@ -275,6 +275,13 @@ HOOKS_DOMAIN="$HOOKS_DOMAIN"
 TG_TOKEN="$TG_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 TG_THREAD_ID="$TG_THREAD_ID"
+DEST_LOCAL="$DEST_LOCAL"
+DEST_SSH="$DEST_SSH"
+DEST_S3="$DEST_S3"
+DEST_TELEGRAM="$DEST_TELEGRAM"
+RCLONE_REMOTE="$RCLONE_REMOTE"
+S3_BUCKET="$S3_BUCKET"
+S3_PREFIX="$S3_PREFIX"
 CONF
   chmod 600 "$CONFIG_FILE"
   success "Все настройки сохранены ✅" >&2
@@ -361,6 +368,158 @@ send_telegram() {
     -o /dev/null 2>&1 || true
 }
 
+# ===== ОТПРАВКА ФАЙЛА В TELEGRAM =====
+# Лимит Bot API на sendDocument — 50 МБ; берём безопасные 45 МБ, крупнее — режем split'ом.
+TG_DOC_LIMIT=$((45 * 1024 * 1024))
+tg_send_document() {
+  local FILE="$1" CAPTION="$2"
+  local ARGS=(-F "chat_id=${TG_CHAT_ID}")
+  [ -n "$TG_THREAD_ID" ] && ARGS+=(-F "message_thread_id=${TG_THREAD_ID}")
+  [ -n "$CAPTION" ] && ARGS+=(-F "caption=${CAPTION}")
+  local CODE
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -F "document=@${FILE}" "${ARGS[@]}" \
+    "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" 2>/dev/null || echo 000)
+  [ "$CODE" = "200" ]
+}
+
+# ===== НАЗНАЧЕНИЕ: SSH (scp) =====
+dest_ssh() {
+  local BD="$1"
+  [ -z "$BACKUP_SERVER" ] && { warn "SSH: сервер не указан — пропуск" >&2; return 1; }
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] scp $BD → ${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/" >&2; return 0; fi
+  if scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "$BD" "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/"; then
+    success "SSH: скопировано ✅" >&2; return 0
+  else
+    error "SSH: ошибка копирования ❌" >&2; log "❌ scp failed"; return 1
+  fi
+}
+
+# ===== НАЗНАЧЕНИЕ: S3 (rclone) =====
+dest_s3() {
+  local BD="$1"
+  [ -z "$RCLONE_REMOTE" ] || [ -z "$S3_BUCKET" ] && { warn "S3: не настроен (remote/bucket) — пропуск" >&2; return 1; }
+  local TARGET="${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/$(basename "$BD")"
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] rclone copy $BD → $TARGET" >&2; return 0; fi
+  if rclone copy "$BD" "$TARGET" 2>/dev/null; then
+    success "S3: загружено → $TARGET ✅" >&2; return 0
+  else
+    error "S3: ошибка rclone ❌" >&2; log "❌ rclone copy failed"; return 1
+  fi
+}
+
+# ===== НАЗНАЧЕНИЕ: Telegram-файлы (sendDocument, со split для >45МБ) =====
+dest_telegram_files() {
+  local BD="$1" LABEL; LABEL="$(basename "$BD")"
+  [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ] && { warn "Telegram: токен/chat_id не заданы — пропуск" >&2; return 1; }
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] Telegram sendDocument для файлов из $BD" >&2; return 0; fi
+  local RC=0 F SZ
+  for F in "$BD"/*.tar.zst "$BD"/*.tar.zst.age "$BD"/SHA256SUMS "$BD"/manifest.txt; do
+    [ -e "$F" ] || continue
+    SZ=$(stat -c%s "$F" 2>/dev/null || echo 0)
+    if [ "$SZ" -le "$TG_DOC_LIMIT" ]; then
+      tg_send_document "$F" "${LABEL}/$(basename "$F")" && success "TG: $(basename "$F") ✅" >&2 || { error "TG: $(basename "$F") ❌" >&2; RC=1; }
+    else
+      info "TG: $(basename "$F") > 45МБ — режем на части..." >&2
+      local TMP; TMP=$(mktemp -d)
+      split -b 45m -d "$F" "$TMP/$(basename "$F").part"
+      local PARTS=("$TMP"/*) P I=1 N
+      N=${#PARTS[@]}
+      for P in "${PARTS[@]}"; do
+        tg_send_document "$P" "${LABEL}/$(basename "$F") [часть ${I}/${N}] — собрать: cat *.part* > файл" \
+          && success "TG: $(basename "$P") ($I/$N) ✅" >&2 || { error "TG: $(basename "$P") ❌" >&2; RC=1; }
+        I=$((I+1))
+      done
+      rm -rf "$TMP"
+    fi
+  done
+  return $RC
+}
+
+# ===== РОТАЦИЯ S3 =====
+rotate_s3_backups() {
+  [ "${DEST_S3:-false}" = "true" ] || return 0
+  [ -z "$RCLONE_REMOTE" ] || [ -z "$S3_BUCKET" ] && return 0
+  header "🗑️ РОТАЦИЯ S3" >&2
+  local BASE="${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}" RET=${BACKUP_RETENTION:-7}
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] ротация S3 в $BASE (лимит $RET)" >&2; return 0; fi
+  local ALL; ALL=$(rclone lsf --dirs-only "$BASE" 2>/dev/null | sed 's#/$##' | grep '^bedolaga-full-backup-' | sort)
+  [ -z "$ALL" ] && { info "S3: бэкапов нет ✅" >&2; return 0; }
+  local CNT; CNT=$(echo "$ALL" | wc -l)
+  info "S3: найдено $CNT (лимит $RET)" >&2
+  if [ "$CNT" -gt "$RET" ]; then
+    local DEL=$((CNT - RET))
+    echo "$ALL" | head -n "$DEL" | while read -r D; do
+      rclone purge "$BASE/$D" 2>/dev/null && { success "S3 удалён: $D ✅" >&2; log "S3 удалён: $D"; } || error "S3: не удалось удалить $D ❌" >&2
+    done
+  else
+    info "S3: удаление не требуется ✅" >&2
+  fi
+}
+
+# ===== ЕДИНАЯ ЗАГРУЗКА ВО ВСЕ ВКЛЮЧЁННЫЕ НАЗНАЧЕНИЯ =====
+UPLOAD_SUMMARY=""
+upload_all() {
+  local BD="$1" OVERALL=0
+  UPLOAD_SUMMARY=""
+  header "📡 ОТПРАВКА В НАЗНАЧЕНИЯ" >&2
+  if [ "${DEST_SSH:-true}" = "true" ] && [ -n "$BACKUP_SERVER" ]; then
+    if dest_ssh "$BD"; then UPLOAD_SUMMARY+="  ✅ SSH (${BACKUP_USER}@${BACKUP_SERVER})"$'\n'; else UPLOAD_SUMMARY+="  ❌ SSH"$'\n'; OVERALL=1; fi
+  fi
+  if [ "${DEST_S3:-false}" = "true" ]; then
+    if dest_s3 "$BD"; then UPLOAD_SUMMARY+="  ✅ S3 (${RCLONE_REMOTE}:${S3_BUCKET})"$'\n'; else UPLOAD_SUMMARY+="  ❌ S3"$'\n'; OVERALL=1; fi
+  fi
+  if [ "${DEST_TELEGRAM:-false}" = "true" ] && [ -n "$TG_TOKEN" ]; then
+    if dest_telegram_files "$BD"; then UPLOAD_SUMMARY+="  ✅ Telegram (файлы)"$'\n'; else UPLOAD_SUMMARY+="  ⚠️ Telegram (файлы, частично)"$'\n'; fi
+  fi
+  [ -z "$UPLOAD_SUMMARY" ] && UPLOAD_SUMMARY="  ⚪ только локально"$'\n'
+  return $OVERALL
+}
+
+# ===== НАСТРОЙКА НАЗНАЧЕНИЙ (интерактивно) =====
+setup_s3() {
+  header "☁️ НАСТРОЙКА S3" >&2
+  info "Провайдер по умолчанию — Selectel. Для другого S3 укажите свой endpoint/region." >&2
+  read -p "Имя rclone-remote [selectel]: " RN >&2; RCLONE_REMOTE="${RN:-selectel}"
+  read -p "Access Key ID: " AK >&2
+  read -p "Secret Access Key: " SK >&2
+  read -p "Endpoint [https://s3.storage.selcloud.ru]: " EP >&2; EP="${EP:-https://s3.storage.selcloud.ru}"
+  read -p "Region [ru-1]: " RG >&2; RG="${RG:-ru-1}"
+  read -p "Bucket (контейнер): " S3_BUCKET >&2
+  read -p "Префикс (папка) [bedolaga-backups]: " PF >&2; S3_PREFIX="${PF:-bedolaga-backups}"
+  if rclone config create "$RCLONE_REMOTE" s3 provider Other access_key_id "$AK" secret_access_key "$SK" endpoint "$EP" region "$RG" >/dev/null 2>&1; then
+    success "rclone remote '$RCLONE_REMOTE' создан ✅" >&2
+  else
+    error "Не удалось создать rclone remote ❌" >&2; DEST_S3=false; return 1
+  fi
+  info "Проверка доступа к бакету '$S3_BUCKET'..." >&2
+  if rclone lsd "${RCLONE_REMOTE}:${S3_BUCKET}" >/dev/null 2>&1 || rclone mkdir "${RCLONE_REMOTE}:${S3_BUCKET}" >/dev/null 2>&1; then
+    success "S3: доступ к бакету ОК ✅" >&2; DEST_S3=true
+  else
+    error "S3: нет доступа — проверьте ключи/endpoint/bucket ❌" >&2; DEST_S3=false; return 1
+  fi
+}
+configure_destinations() {
+  header "📡 НАЗНАЧЕНИЯ БЭКАПОВ" >&2
+  echo "Текущие:" >&2
+  echo "  SSH:            ${DEST_SSH:-true}  (${BACKUP_SERVER:-нет})" >&2
+  echo "  S3:             ${DEST_S3:-false}  (${RCLONE_REMOTE:+${RCLONE_REMOTE}:${S3_BUCKET}})" >&2
+  echo "  Telegram-файлы: ${DEST_TELEGRAM:-false}" >&2
+  echo "" >&2
+  echo "1) Переключить SSH" >&2
+  echo "2) Настроить/включить S3 (Selectel и др.)" >&2
+  echo "3) Переключить Telegram-файлы" >&2
+  echo "4) Выключить S3" >&2
+  read -p "Выбор [1-4]: " D >&2
+  case "$D" in
+    1) [ "${DEST_SSH:-true}" = "true" ] && DEST_SSH=false || DEST_SSH=true; success "SSH: $DEST_SSH" >&2 ;;
+    2) setup_s3 ;;
+    3) [ "${DEST_TELEGRAM:-false}" = "true" ] && DEST_TELEGRAM=false || DEST_TELEGRAM=true; success "Telegram-файлы: $DEST_TELEGRAM" >&2 ;;
+    4) DEST_S3=false; success "S3 выключен" >&2 ;;
+    *) info "Отмена" >&2; return 0 ;;
+  esac
+  save_all_config
+}
+
 # ===== ЗАГРУЗКА ИЛИ СОЗДАНИЕ КОНФИГА =====
 NEED_FULL_SETUP=false
 
@@ -382,6 +541,15 @@ fi
 
 ROLE="${ROLE:-all}"
 valid_scope "$ROLE" || ROLE="all"
+
+# Назначения бэкапов (по умолчанию: локально + SSH, если задан сервер)
+DEST_LOCAL="${DEST_LOCAL:-true}"
+DEST_SSH="${DEST_SSH:-true}"
+DEST_S3="${DEST_S3:-false}"
+DEST_TELEGRAM="${DEST_TELEGRAM:-false}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+S3_BUCKET="${S3_BUCKET:-}"
+S3_PREFIX="${S3_PREFIX:-bedolaga-backups}"
 
 # Валидация --only и предварительное разрешение SCOPE (для cron/неинтерактивного режима)
 if [ -n "$ONLY" ]; then
@@ -460,8 +628,10 @@ do_settings() {
   echo "4) Резервный сервер (IP, пользователь, путь, retention)" >&2
   echo "5) Время автобэкапа (cron)" >&2
   echo "6) Кастомные файлы (защита при обновлении)" >&2
-  read -p "Выбор [1-6]: " SACT >&2
-  [[ ! "$SACT" =~ ^[1-6]$ ]] && { error "Неверный выбор" >&2; return 1; }
+  echo "7) Назначения бэкапов (SSH, S3, Telegram-файлы)" >&2
+  echo "8) Роль сервера (всё / только бот / только кабинет)" >&2
+  read -p "Выбор [1-8]: " SACT >&2
+  [[ ! "$SACT" =~ ^[1-8]$ ]] && { error "Неверный выбор" >&2; return 1; }
 
   case "$SACT" in
     1)
@@ -530,6 +700,19 @@ do_settings() {
       echo "" >&2
       info "Открываю редактор..." >&2
       nano "$CUSTOM_FILES"
+      ;;
+    7)
+      configure_destinations
+      ;;
+    8)
+      echo "" >&2
+      info "Текущая роль: ${ROLE:-all}" >&2
+      echo "  1) Всё вместе (бот + кабинет)" >&2
+      echo "  2) Только бот" >&2
+      echo "  3) Только кабинет" >&2
+      read -p "Выбор [1-3]: " RSEL >&2
+      case "$RSEL" in 2) ROLE="bot";; 3) ROLE="cabinet";; 1) ROLE="all";; *) error "Отмена" >&2; return 1;; esac
+      success "Роль: $ROLE" >&2; save_all_config
       ;;
   esac
 }
@@ -709,21 +892,13 @@ do_backup() {
   success "Манифест и SHA256SUMS записаны ✅" >&2
   rm -rf "$STAGE"
 
-  info "Копирование на сервер..." >&2
   local SCP_STATUS=0
-  if [ -z "$BACKUP_SERVER" ]; then
-    warn "Резервный сервер не указан. Копирование пропущено." >&2
-  elif [ "$DRY_RUN" = true ]; then
-    info "[dry-run] scp $BD → ${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/ (пропущено)" >&2
-  else
-    scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "$BD" "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/" \
-      && success "Скопировано ✅" >&2 \
-      || { error "Ошибка копирования ❌" >&2; log "❌ scp failed"; SCP_STATUS=1; }
-  fi
+  upload_all "$BD" || SCP_STATUS=1
 
   log "Бэкап: $BD"
   rotate_local_backups
   rotate_remote_backups
+  rotate_s3_backups
 
   if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
     local ELAPSED=$(( $(date +%s) - BACKUP_START ))
@@ -743,8 +918,6 @@ do_backup() {
     local SRV_UPTIME; SRV_UPTIME=$(uptime -p 2>/dev/null || uptime)
     local DOCKER_STATUS; DOCKER_STATUS=$(docker ps --format '  {{.Names}}: {{.Status}}' 2>/dev/null)
     local LOCAL_CNT; LOCAL_CNT=$(ls -1d /root/bedolaga-local-backups/bedolaga-full-backup-* 2>/dev/null | wc -l)
-    local SCP_TEXT
-    [ "$SCP_STATUS" -eq 0 ] && SCP_TEXT="✅ OK (${BACKUP_USER}@${BACKUP_SERVER})" || SCP_TEXT="❌ Ошибка"
 
     check_updates
     check_smtp
@@ -761,8 +934,8 @@ ${FILES_INFO}
 🐳 <b>Контейнеры:</b>
 ${DOCKER_STATUS}
 
-📡 <b>Копия на сервер:</b> ${SCP_TEXT}
-🗂 <b>Бэкапов хранится:</b> ${LOCAL_CNT}
+📡 <b>Назначения:</b>
+${UPLOAD_SUMMARY}🗂 <b>Бэкапов хранится (локально):</b> ${LOCAL_CNT}
 ⏱ <b>Время выполнения:</b> ${ELAPSED_FMT}
 📧 <b>SMTP:</b> ${SMTP_CHECK_RESULT}
 
