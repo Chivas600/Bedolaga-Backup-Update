@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.1"
+VERSION="3.0.2"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -372,6 +372,40 @@ send_telegram() {
     -o /dev/null 2>&1 || true
 }
 
+# ===== МАСКИРОВКА СЕКРЕТА =====
+# Показывает начало и конец, середину скрывает звёздочками (для верификации без раскрытия).
+mask_secret() {
+  local s="$1" n=${#1}
+  if [ "$n" -le 28 ]; then echo "****"; return; fi
+  echo "${s:0:20}************${s: -8}"
+}
+
+# ===== ОТПРАВКА В TELEGRAM С САМОУНИЧТОЖЕНИЕМ =====
+# Отправляет сообщение и планирует его удаление через TTL секунд.
+# (Bot API не умеет «после прочтения», поэтому таймер идёт от момента отправки.)
+tg_send_selfdestruct() {
+  local MSG="$1" TTL="${2:-180}"
+  if [ "$DRY_RUN" = true ]; then info "[dry-run] Telegram self-destruct не отправляется" >&2; return 0; fi
+  { [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; } && return 1
+  local THREAD_ARGS=()
+  [ -n "$TG_THREAD_ID" ] && THREAD_ARGS=(-d "message_thread_id=${TG_THREAD_ID}")
+  local RESP MID
+  RESP=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" "${THREAD_ARGS[@]}" \
+    --data-urlencode "text=$MSG" 2>/dev/null)
+  MID=$(printf '%s' "$RESP" | jq -r '.result.message_id // empty' 2>/dev/null)
+  [ -z "$MID" ] && return 1
+  # Фоновая отложенная зачистка: закрываем fd блокировки (иначе лок держался бы весь TTL),
+  # игнорируем SIGHUP, чтобы процесс пережил завершение скрипта.
+  ( exec 9>&- 2>/dev/null; trap '' HUP
+    sleep "$TTL"
+    curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/deleteMessage" \
+      -d "chat_id=${TG_CHAT_ID}" -d "message_id=${MID}" -o /dev/null 2>&1
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
 # ===== ОТПРАВКА ФАЙЛА В TELEGRAM =====
 # Лимит Bot API на sendDocument — 50 МБ; берём безопасные 45 МБ, крупнее — режем split'ом.
 TG_DOC_LIMIT=$((45 * 1024 * 1024))
@@ -583,20 +617,24 @@ TXT
   echo "" >&2
 
   if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-    read -p "Прислать ключ и инструкцию в Telegram (личный чат)? [y/N]: " TS >&2
+    read -p "Прислать в Telegram уведомление (ключ будет ЗАМАСКИРОВАН)? [y/N]: " TS >&2
     if [[ "$TS" =~ ^[Yy]$ ]]; then
-      send_telegram "🔐 <b>Bedolaga — приватный age-ключ для бэкапов</b>
+      local MASKED; MASKED=$(mask_secret "$PRIV")
+      if tg_send_selfdestruct "🔐 <b>Bedolaga — age-ключ бэкапов создан</b>
 
-⚠️ <b>СОХРАНИТЕ</b> этот ключ (менеджер паролей) и затем <b>УДАЛИТЕ</b> это сообщение.
-Без него зашифрованные бэкапы восстановить НЕВОЗМОЖНО.
-
-🔑 <b>Приватный ключ:</b>
-<code>${PRIV}</code>
+⚠️ Полный приватный ключ показан в <b>ТЕРМИНАЛЕ</b> — сохраните его там (менеджер паролей).
+Здесь он показан частично (в целях безопасности):
+🔑 <code>${MASKED}</code>
 
 🔓 Публичный ключ: <code>${PUB}</code>
 
-<b>Как восстановить:</b> bedolaga-update → «5) Восстановление» → при запросе вставьте этот ключ."
-      success "Отправлено в Telegram. Сохраните и удалите сообщение!" >&2
+<b>Восстановление:</b> bedolaga-update → «5) Восстановление» → вставьте ПОЛНЫЙ ключ.
+
+🧨 Это сообщение самоуничтожится через 3 минуты." 180; then
+        success "Отправлено в Telegram (ключ замаскирован, сообщение удалится через 3 минуты)." >&2
+      else
+        warn "Не удалось отправить/запланировать удаление в Telegram." >&2
+      fi
     fi
   fi
 
