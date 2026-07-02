@@ -11,11 +11,17 @@ header()  { echo -e "\n\033[1;36m=== $1 ===\033[0m\n" >&2; }
 CONFIG_FILE="/root/.bedolaga-config"
 CRON_MODE=false
 DRY_RUN=false
-for _arg in "$@"; do
-  case "$_arg" in
+ONLY=""          # --only bot|cabinet|all: выбор компонентов на этот запуск
+VERIFY_RESTORE=false
+while [ $# -gt 0 ]; do
+  case "$1" in
     --cron)    CRON_MODE=true ;;
     --dry-run) DRY_RUN=true ;;
+    --only)    shift; ONLY="${1:-}" ;;
+    --only=*)  ONLY="${1#--only=}" ;;
+    --verify-restore) VERIFY_RESTORE=true ;;
   esac
+  shift
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
@@ -30,6 +36,29 @@ guard() {
   fi
   "$@"
 }
+
+# ===== ВЫБОР КОМПОНЕНТОВ (бот / кабинет / всё) =====
+# ROLE  — что физически есть на этом хосте (all|bot|cabinet); для разнесённых инстансов.
+# SCOPE — что бэкапим/восстанавливаем на этот запуск (all|bot|cabinet).
+# component_available: доступен ли компонент на хосте (по ROLE)
+component_available() {
+  case "${ROLE:-all}" in
+    all)     return 0 ;;
+    bot)     [[ "$1" == "bot" || "$1" == "caddy" ]] ;;
+    cabinet) [[ "$1" == "cabinet" ]] ;;
+    *)       return 0 ;;
+  esac
+}
+# want_component: нужно ли трогать компонент на этот запуск (ROLE ∩ SCOPE)
+want_component() {
+  component_available "$1" || return 1
+  case "$1" in
+    bot|caddy) [[ "${SCOPE:-all}" == "all" || "${SCOPE:-all}" == "bot" ]] ;;
+    cabinet)   [[ "${SCOPE:-all}" == "all" || "${SCOPE:-all}" == "cabinet" ]] ;;
+    *)         return 1 ;;
+  esac
+}
+valid_scope() { [[ "$1" =~ ^(all|bot|cabinet)$ ]]; }
 
 clean_domain() { local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; echo "$d" | xargs; }
 is_valid_domain() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; }
@@ -166,25 +195,41 @@ detect_paths() {
   done
 
   echo "" >&2
-  prompt_path "бот" "$FOUND_BOT" "bot" && BOT_DIR="$PROMPT_PATH_RESULT"
-  prompt_path "кабинет" "$FOUND_CABINET" "cabinet" && CABINET_DIR="$PROMPT_PATH_RESULT"
+  if component_available bot; then
+    prompt_path "бот" "$FOUND_BOT" "bot" && BOT_DIR="$PROMPT_PATH_RESULT"
+  else
+    BOT_DIR=""; info "Роль=$ROLE — бот на этом хосте не используется, пропуск" >&2
+  fi
+  if component_available cabinet; then
+    prompt_path "кабинет" "$FOUND_CABINET" "cabinet" && CABINET_DIR="$PROMPT_PATH_RESULT"
+  else
+    CABINET_DIR=""; info "Роль=$ROLE — кабинет на этом хосте не используется, пропуск" >&2
+  fi
 
   echo "" >&2
-  if [ -n "$FOUND_CADDY" ]; then
-    info "Найден путь к Caddy: $FOUND_CADDY" >&2
-    read -p "✅ Использовать? [y/N]: " CC >&2
-    [[ "$CC" =~ ^[Yy]$ ]] && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
+  if component_available caddy; then
+    if [ -n "$FOUND_CADDY" ]; then
+      info "Найден путь к Caddy: $FOUND_CADDY" >&2
+      read -p "✅ Использовать? [y/N]: " CC >&2
+      [[ "$CC" =~ ^[Yy]$ ]] && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
+    else
+      info "Caddy не найден. Введите путь или Enter для пропуска" >&2
+      read -p "📁 Путь к Caddy: " CADDY_DIR >&2
+    fi
+    CADDY_DIR="$(echo "${CADDY_DIR//\"/}" | xargs)"
+    [ -n "$CADDY_DIR" ] && [ ! -d "$CADDY_DIR" ] && { warn "Папка не найдена — Caddy пропущен" >&2; CADDY_DIR=""; }
+    [ -z "$CADDY_DIR" ] && info "Caddy: не используется" >&2
   else
-    info "Caddy не найден. Введите путь или Enter для пропуска" >&2
-    read -p "📁 Путь к Caddy: " CADDY_DIR >&2
+    CADDY_DIR=""
   fi
-  CADDY_DIR="$(echo "${CADDY_DIR//\"/}" | xargs)"
-  [ -n "$CADDY_DIR" ] && [ ! -d "$CADDY_DIR" ] && { warn "Папка не найдена — Caddy пропущен" >&2; CADDY_DIR=""; }
-  [ -z "$CADDY_DIR" ] && info "Caddy: не используется" >&2
 
   echo "" >&2; info "Проверка путей..." >&2
-  [ -d "$BOT_DIR" ] && success "Бот: $BOT_DIR ✅" >&2 || { error "Бот: папка не существует ❌" >&2; return 1; }
-  [ -d "$CABINET_DIR" ] && success "Кабинет: $CABINET_DIR ✅" >&2 || { error "Кабинет: папка не существует ❌" >&2; return 1; }
+  if component_available bot; then
+    [ -d "$BOT_DIR" ] && success "Бот: $BOT_DIR ✅" >&2 || { error "Бот: папка не существует ❌" >&2; return 1; }
+  fi
+  if component_available cabinet; then
+    [ -d "$CABINET_DIR" ] && success "Кабинет: $CABINET_DIR ✅" >&2 || { error "Кабинет: папка не существует ❌" >&2; return 1; }
+  fi
   [ -z "$CADDY_DIR" ] || [ -d "$CADDY_DIR" ] && success "Caddy: ${CADDY_DIR:-нет} ✅" >&2 || { error "Caddy: папка не существует ❌" >&2; return 1; }
   return 0
 }
@@ -221,6 +266,7 @@ BACKUP_USER="$BACKUP_USER"
 BACKUP_REMOTE_DIR="$BACKUP_REMOTE_DIR"
 BACKUP_RETENTION="$BACKUP_RETENTION"
 BACKUP_SSH_PORT="$BACKUP_SSH_PORT"
+ROLE="$ROLE"
 BOT_DIR="$BOT_DIR"
 CABINET_DIR="$CABINET_DIR"
 CADDY_DIR="$CADDY_DIR"
@@ -238,8 +284,8 @@ CONF
 check_critical_config() {
   local MISSING=()
   [ -z "$BACKUP_SERVER" ] && MISSING+=("BACKUP_SERVER")
-  [ -z "$BOT_DIR" ] && MISSING+=("BOT_DIR")
-  [ -z "$CABINET_DIR" ] && MISSING+=("CABINET_DIR")
+  component_available bot     && [ -z "$BOT_DIR" ]     && MISSING+=("BOT_DIR")
+  component_available cabinet && [ -z "$CABINET_DIR" ] && MISSING+=("CABINET_DIR")
   if [ ${#MISSING[@]} -gt 0 ]; then
     warn "В конфиге не хватает: ${MISSING[*]}" >&2
     return 1
@@ -334,6 +380,20 @@ else
   NEED_FULL_SETUP=true
 fi
 
+ROLE="${ROLE:-all}"
+valid_scope "$ROLE" || ROLE="all"
+
+# Валидация --only и предварительное разрешение SCOPE (для cron/неинтерактивного режима)
+if [ -n "$ONLY" ]; then
+  valid_scope "$ONLY" || { echo "ERROR: --only принимает bot|cabinet|all (получено: '$ONLY')" >&2; exit 1; }
+  if ! component_available "$ONLY" && [ "$ONLY" != "all" ]; then
+    echo "ERROR: компонент '$ONLY' недоступен на этом хосте (ROLE=$ROLE)" >&2; exit 1
+  fi
+  SCOPE="$ONLY"
+else
+  SCOPE="all"   # ограничивается доступностью по ROLE через want_component
+fi
+
 if [ "$CRON_MODE" = true ] && [ "$NEED_FULL_SETUP" = true ]; then
   echo "ERROR: Конфиг не найден ($CONFIG_FILE). Сначала запустите скрипт интерактивно." >&2
   exit 1
@@ -349,6 +409,14 @@ if [ "$NEED_FULL_SETUP" = true ]; then
   read -p "👤 Пользователь [root]: " U >&2; BACKUP_USER="${U:-root}"; [ -z "$U" ] && success "root" >&2
   read -p "📁 Путь бэкапов [/root/bedolaga-backups]: " P >&2; BACKUP_REMOTE_DIR="${P:-/root/bedolaga-backups}"; [ -z "$P" ] && success "по умолчанию" >&2
   read -p "📦 Хранить бэкапов [7]: " R >&2; BACKUP_RETENTION="${R:-7}"; [ -z "$R" ] && success "7" >&2
+  echo "" >&2
+  info "Роль этого сервера (что на нём установлено):" >&2
+  echo "  1) Всё вместе (бот + кабинет)" >&2
+  echo "  2) Только бот" >&2
+  echo "  3) Только кабинет" >&2
+  read -p "Выбор [1-3, по умолчанию 1]: " RSEL >&2
+  case "$RSEL" in 2) ROLE="bot";; 3) ROLE="cabinet";; *) ROLE="all";; esac
+  success "Роль: $ROLE" >&2
   echo "" >&2
   detect_paths || exit 1
   echo "" >&2
@@ -482,6 +550,21 @@ else
   read -p "Выбор [1-5]: " ACT >&2
   [[ ! "$ACT" =~ ^[1-5]$ ]] && { error "Неверно" >&2; exit 1; }
   [ "$ACT" = "4" ] && { do_settings; exit 0; }
+
+  # Выбор компонентов для бэкапа (если не задан --only)
+  if [[ "$ACT" == "1" || "$ACT" == "3" ]] && [ -z "$ONLY" ]; then
+    if [ "$ROLE" = "all" ]; then
+      echo "" >&2; echo "Что бэкапим?" >&2
+      echo "  1) Всё (бот + кабинет + caddy)" >&2
+      echo "  2) Только бот" >&2
+      echo "  3) Только кабинет" >&2
+      read -p "Выбор [1-3, по умолчанию 1]: " SCSEL >&2
+      case "$SCSEL" in 2) SCOPE="bot";; 3) SCOPE="cabinet";; *) SCOPE="all";; esac
+    else
+      SCOPE="$ROLE"
+    fi
+    info "Компоненты этого бэкапа: $SCOPE" >&2
+  fi
 fi
 
 # ===== ПРОВЕРКА ОБНОВЛЕНИЙ =====
@@ -550,6 +633,7 @@ do_backup() {
   local STAGE; STAGE=$(mktemp -d "/tmp/bedolaga-stage-$TS.XXXXXX")
   mkdir -p "$BD" "$STAGE/bot" "$STAGE/cabinet" "$STAGE/caddy"; log "Создано: $BD"
 
+  if want_component bot; then
   info "Конфиги бота..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; rm -rf "$STAGE"; return 1; }
   cp .env docker-compose.yml "$STAGE/bot/"; check_backup_file "$STAGE/bot/.env" ".env"; check_backup_file "$STAGE/bot/docker-compose.yml" "docker-compose.yml"
 
@@ -575,14 +659,22 @@ do_backup() {
     docker run --rm -v "$RV":/source -v "$STAGE/bot":/backup alpine tar -czf /backup/redis_data.tar.gz -C /source .
     check_backup_file "$STAGE/bot/redis_data.tar.gz" "Redis"
   fi
+  else
+    info "Бот: пропуск (scope=$SCOPE, role=$ROLE)" >&2
+  fi
 
+  if want_component cabinet; then
   info "Кабинет..." >&2
   if [ -d "$CABINET_DIR" ]; then
     cd "$CABINET_DIR" 2>/dev/null && { cp .env package*.json "$STAGE/cabinet/" 2>/dev/null||true; cp -r src/ "$STAGE/cabinet/" 2>/dev/null||true; }
     [ -f "$STAGE/cabinet/.env" ] && success "Конфиг ✅" >&2||info "Конфиг не найден" >&2
     [ -d "$STAGE/cabinet/src" ] && success "Код ✅" >&2||info "Код не найден" >&2
   fi
-  if [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ]; then
+  else
+    info "Кабинет: пропуск (scope=$SCOPE, role=$ROLE)" >&2
+  fi
+
+  if want_component caddy && [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ]; then
     cp "$CADDY_DIR/Caddyfile" "$STAGE/caddy/" 2>/dev/null && success "Caddy ✅" >&2
   fi
 
@@ -608,6 +700,7 @@ do_backup() {
     echo "created: $(date '+%Y-%m-%d %H:%M:%S %z')"
     echo "timestamp: $TS"
     echo "role: ${ROLE:-all}"
+    echo "scope: ${SCOPE:-all}"
     echo "host: $(hostname)"
     echo "pg_user: $PG_USER"
     echo "pg_db: $PG_DB"
@@ -739,6 +832,7 @@ do_update() {
   CUSTOM_TMP="/tmp/bedolaga-custom-$(date +%s)"
   mkdir -p "$CUSTOM_TMP"
 
+  if want_component bot; then
   info "Бот..." >&2; cd "$BOT_DIR" || { error "Папка бота не найдена" >&2; return 1; }
   save_custom_files "$BOT_DIR" "bot"
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
@@ -748,7 +842,11 @@ do_update() {
   docker compose up -d --build bot
   sleep 10
   if docker compose ps | grep -q "remnawave_bot.*(healthy)"; then success "Бот: healthy ✅" >&2; else warn "Бот: проверка ⚠️" >&2; docker compose logs --tail=20 bot||true; fi
+  else
+    info "Бот: обновление пропущено (scope=$SCOPE, role=$ROLE)" >&2
+  fi
 
+  if want_component cabinet; then
   info "Кабинет..." >&2; cd "$CABINET_DIR" || { error "Папка кабинета не найдена" >&2; return 1; }
   save_custom_files "$CABINET_DIR" "cabinet"
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
@@ -759,6 +857,9 @@ do_update() {
   docker compose up -d --build cabinet-frontend
   sleep 15
   if docker exec cabinet_frontend wget --no-verbose --tries=1 --spider http://127.0.0.1:80/ 2>&1 | grep -qE "200|exists|connected"; then success "Кабинет: healthy ✅" >&2; else warn "Кабинет: проверка ⚠️" >&2; docker compose logs --tail=30 cabinet-frontend||true; fi
+  else
+    info "Кабинет: обновление пропущено (scope=$SCOPE, role=$ROLE)" >&2
+  fi
 
   info "Caddy..." >&2
   if [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ]; then
