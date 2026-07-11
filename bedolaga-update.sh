@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.6"
+VERSION="3.0.7"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1286,7 +1286,10 @@ apply_injections() {
 do_update() {
   header "🔄 ОБНОВЛЕНИЕ" >&2
   if [ "$DRY_RUN" = true ]; then
-    info "[dry-run] Обновление пропущено: git reset --hard + docker compose пересборка бота/кабинета/caddy не выполняются" >&2
+    info "[dry-run] Обновление: git reset --hard + docker compose пересборка НЕ выполняются" >&2
+    info "[dry-run] Статус инъекций после обновления:" >&2
+    want_component cabinet && apply_injections "$CABINET_DIR"
+    want_component bot && apply_injections "$BOT_DIR"
     return 0
   fi
   info "Запуск..." >&2
