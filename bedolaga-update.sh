@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.5"
+VERSION="3.0.6"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -44,6 +44,8 @@ guard() {
 trim_input() { printf '%s' "$1" | tr -d '[:space:]'; }
 # _yes ОТВЕТ -> 0, если это y/yes (без учёта регистра и мусора)
 _yes() { [[ "$(trim_input "$1")" =~ ^[Yy]([Ee][Ss])?$ ]]; }
+# trim_ws: срезает только ведущие/замыкающие пробелы и \r (внутренние сохраняет)
+trim_ws() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
 # ===== ВЫБОР КОМПОНЕНТОВ (бот / кабинет / всё) =====
 # ROLE  — что физически есть на этом хосте (all|bot|cabinet); для разнесённых инстансов.
@@ -808,8 +810,9 @@ do_settings() {
   echo "7) Назначения бэкапов (SSH, S3, Telegram-файлы)" >&2
   echo "8) Роль сервера (всё / только бот / только кабинет)" >&2
   echo "9) Шифрование age (генерация ключа, вкл/выкл)" >&2
-  read -p "Выбор [1-9]: " SACT >&2
-  [[ ! "$SACT" =~ ^[1-9]$ ]] && { error "Неверный выбор" >&2; return 1; }
+  echo "10) Инъекции в файлы (дописать строку после обновления)" >&2
+  read -p "Выбор [1-10]: " SACT >&2
+  [[ ! "$SACT" =~ ^([1-9]|10)$ ]] && { error "Неверный выбор" >&2; return 1; }
 
   case "$SACT" in
     1)
@@ -903,6 +906,27 @@ do_settings() {
         2) ENCRYPT=false; save_all_config; success "Шифрование выключено (ключ в конфиге сохранён)" >&2 ;;
         *) info "Отмена" >&2 ;;
       esac
+      ;;
+    10)
+      echo "" >&2
+      info "Список инъекций ($INJECT_FILES):" >&2
+      info "Формат строки: файл | якорь | сниппет  (# — комментарий)" >&2
+      if [ -f "$INJECT_FILES" ]; then cat "$INJECT_FILES" >&2; else
+        info "(файла нет — создаю с примером)" >&2
+        cat > "$INJECT_FILES" <<'INJ'
+# Инъекции строк в файлы после обновления (идемпотентно: добавляется, только если строки ещё нет).
+# Формат: файл | якорь | сниппет
+#   файл    — относительно папки компонента (кабинет/бот) или абсолютный путь
+#   якорь   — перед какой строкой вставить (литеральное совпадение)
+#   сниппет — что вставить
+# Пример (виджет поддержки в кабинет, перед </body>):
+# index.html | </body> | <script src="https://help.whiterabbit.st/widget.js"></script>
+INJ
+        cat "$INJECT_FILES" >&2
+      fi
+      echo "" >&2
+      info "Открываю редактор..." >&2
+      nano "$INJECT_FILES"
       ;;
   esac
 }
@@ -1208,6 +1232,56 @@ restore_custom_files() {
   done < "$CUSTOM_FILES"
 }
 
+# ===== ИНЪЕКЦИИ В ФАЙЛЫ (дописать строку, если её нет — после обновления) =====
+# Список: /root/.bedolaga-inject, формат строки: файл | якорь | сниппет
+#   файл    — относительно папки компонента или абсолютный путь
+#   якорь   — перед какой строкой вставить (литеральное совпадение, напр. </body>)
+#   сниппет — что вставить (напр. <script src="https://..."></script>)
+# Идемпотентно: если сниппет уже есть в файле — ничего не делает.
+INJECT_FILES="/root/.bedolaga-inject"
+apply_injections() {
+  local DIR="$1"
+  [ -f "$INJECT_FILES" ] || return 0
+  local line FILE ANCHOR SNIPPET rest TARGET
+  while IFS= read -r line; do
+    line="$(trim_ws "$line")"
+    [ -z "$line" ] && continue
+    [ "${line:0:1}" = "#" ] && continue
+    FILE="$(trim_ws "${line%%|*}")"
+    rest="${line#*|}"
+    ANCHOR="$(trim_ws "${rest%%|*}")"
+    SNIPPET="$(trim_ws "${rest#*|}")"
+    if [ -z "$FILE" ] || [ -z "$ANCHOR" ] || [ -z "$SNIPPET" ]; then
+      warn "inject: строка пропущена (нужен формат 'файл | якорь | сниппет'): $line" >&2; continue
+    fi
+    if [[ "$FILE" = /* ]]; then TARGET="$FILE"; else TARGET="$DIR/$FILE"; fi
+    [ -f "$TARGET" ] || continue
+    if grep -qF -- "$SNIPPET" "$TARGET"; then
+      info "inject: уже присутствует в $(basename "$TARGET") — пропуск" >&2; continue
+    fi
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] inject: добавил бы строку в $TARGET перед '$ANCHOR'" >&2; continue
+    fi
+    local TMP="${TARGET}.binject.$$"
+    if awk -v ins="$SNIPPET" -v anc="$ANCHOR" '
+        !done && index($0, anc) { print ins; done=1 }
+        { print }
+        END { exit (done ? 0 : 3) }
+      ' "$TARGET" > "$TMP"; then
+      mv "$TMP" "$TARGET"
+      success "inject: строка добавлена в $(basename "$TARGET") ✅" >&2
+      log "🔧 inject: $(basename "$TARGET") ← $SNIPPET"
+    else
+      local rc=$?; rm -f "$TMP"
+      if [ "$rc" -eq 3 ]; then
+        warn "inject: якорь '$ANCHOR' не найден в $(basename "$TARGET") — пропуск" >&2
+      else
+        error "inject: ошибка обработки $(basename "$TARGET") ❌" >&2
+      fi
+    fi
+  done < "$INJECT_FILES"
+}
+
 # ===== ОБНОВЛЕНИЕ =====
 do_update() {
   header "🔄 ОБНОВЛЕНИЕ" >&2
@@ -1226,6 +1300,7 @@ do_update() {
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
   git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$BOT_DIR" "bot"
+  apply_injections "$BOT_DIR"
   docker compose down
   if ! docker compose up -d --build bot; then error "Бот: пересборка контейнера упала ❌" >&2; log "❌ Бот: docker compose up --build не удался"; UPDATE_RC=1; fi
   sleep 10
@@ -1240,6 +1315,7 @@ do_update() {
   _branch=$(git remote show origin | awk '/HEAD branch/{print $NF}')
   git fetch origin && git reset --hard "origin/$_branch"
   restore_custom_files "$CABINET_DIR" "cabinet"
+  apply_injections "$CABINET_DIR"
   if ! npm install --silent 2>/tmp/bedolaga-cab-npm.log; then
     error "Кабинет: npm install упал ❌" >&2; tail -n 12 /tmp/bedolaga-cab-npm.log | tee -a "$REPORT_FILE" >&2
     log "❌ Кабинет: npm install не удался"; UPDATE_RC=1
