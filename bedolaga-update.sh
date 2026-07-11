@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.7"
+VERSION="3.0.8"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1694,8 +1694,10 @@ do_restore() {
 }
 
 # ===== БЛОКИРОВКА (flock) — не даём двум запускам идти параллельно =====
+# ВАЖНО: 2>/dev/null нельзя вешать прямо на `exec` — это навсегда перенаправит stderr
+# всего скрипта в /dev/null. Гасим возможную ошибку открытия через brace-группу.
 LOCK_FILE="/var/lock/bedolaga-backup.lock"
-exec 9>"$LOCK_FILE" 2>/dev/null || exec 9>"/tmp/bedolaga-backup.lock"
+{ exec 9>"$LOCK_FILE"; } 2>/dev/null || { exec 9>"/tmp/bedolaga-backup.lock"; } 2>/dev/null
 if ! flock -n 9; then
   warn "Другой экземпляр bedolaga-update уже выполняется — пропуск этого запуска." >&2
   log "⏭ Пропуск: параллельный запуск заблокирован flock" 2>/dev/null || true
