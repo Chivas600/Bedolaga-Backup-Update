@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.8"
+VERSION="3.0.9"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -796,6 +796,7 @@ check_disk_space() {
 }
 
 CUSTOM_FILES="/root/.bedolaga-custom-files"
+INJECT_FILES="/root/.bedolaga-inject"
 
 # ===== НАСТРОЙКИ =====
 do_settings() {
@@ -1238,7 +1239,7 @@ restore_custom_files() {
 #   якорь   — перед какой строкой вставить (литеральное совпадение, напр. </body>)
 #   сниппет — что вставить (напр. <script src="https://..."></script>)
 # Идемпотентно: если сниппет уже есть в файле — ничего не делает.
-INJECT_FILES="/root/.bedolaga-inject"
+# (INJECT_FILES объявлен выше, рядом с CUSTOM_FILES, чтобы был доступен и в do_settings.)
 apply_injections() {
   local DIR="$1"
   [ -f "$INJECT_FILES" ] || return 0
