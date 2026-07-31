@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.9"
+VERSION="3.0.10"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1416,6 +1416,20 @@ except Exception as e:
 }
 
 # ===== ПРОВЕРКА =====
+# http_probe URL ACCEPT_REGEX [tries] [delay] — ретрай HTTP-проверки.
+# Печатает последний код, возвращает 0 если код совпал с ACCEPT_REGEX хотя бы раз.
+# Нужен, т.к. Caddy перезапускается прямо перед проверкой и первые пару секунд не отвечает.
+http_probe() {
+  local URL="$1" ACC="$2" TRIES="${3:-4}" DELAY="${4:-2}" i code
+  for (( i=1; i<=TRIES; i++ )); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -k --connect-timeout 5 --max-time 10 "$URL" 2>/dev/null)
+    code="${code:-000}"
+    if [[ "$code" =~ $ACC ]]; then echo "$code"; return 0; fi
+    [ "$i" -lt "$TRIES" ] && sleep "$DELAY"
+  done
+  echo "$code"; return 1
+}
+
 do_check() {
   header "✅ ПРОВЕРКА" >&2
   info "Контейнеры:" >&2
@@ -1431,8 +1445,24 @@ do_check() {
   else
     success "Все контейнеры работают штатно 🟢" >&2
   fi
-  [ -n "$PRIMARY_DOMAIN" ] && { info "Кабинет: $PRIMARY_DOMAIN..." >&2; curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$PRIMARY_DOMAIN" | grep -q "200" && success "Кабинет: 200 🟢" >&2 || { error "Кабинет: не отвечает ❌" >&2; }; }
-  [ -n "$HOOKS_DOMAIN" ] && { info "API: $HOOKS_DOMAIN..." >&2; local AC; AC=$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 5 --max-time 10 "https://$HOOKS_DOMAIN" 2>/dev/null); AC="${AC:-000}"; [[ "$AC" =~ ^(200|404|405|401|403)$ ]] && success "API: $AC 🟢" >&2 || { error "API: код $AC ❌" >&2; }; }
+  if [ -n "$PRIMARY_DOMAIN" ]; then
+    info "Кабинет: $PRIMARY_DOMAIN..." >&2
+    local CC
+    if CC=$(http_probe "https://$PRIMARY_DOMAIN" '^200$' 4 2); then
+      success "Кабинет: $CC 🟢" >&2
+    else
+      error "Кабинет: не отвечает (последний код $CC, после ретраев) ❌" >&2
+    fi
+  fi
+  if [ -n "$HOOKS_DOMAIN" ]; then
+    info "API: $HOOKS_DOMAIN..." >&2
+    local AC
+    if AC=$(http_probe "https://$HOOKS_DOMAIN" '^(200|404|405|401|403)$' 4 2); then
+      success "API: $AC 🟢" >&2
+    else
+      error "API: код $AC ❌" >&2
+    fi
+  fi
   check_smtp
   return 0
 }
