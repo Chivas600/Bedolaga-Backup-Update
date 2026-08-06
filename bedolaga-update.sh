@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.10"
+VERSION="3.0.11"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -568,9 +568,15 @@ obtain_age_key() {
   fi
   warn "Нужен приватный age-ключ — на сервере он не хранится." >&2
   info "Вставьте строку ключа (AGE-SECRET-KEY-1...) и нажмите Enter:" >&2
-  local K; read -r K >&2
-  K="$(echo "$K" | xargs)"
+  local K RAW
+  read -r RAW </dev/tty || read -r RAW
+  # Терминал мог перенести вставленную строку: убираем ВСЕ пробелы/переводы строк,
+  # приводим к верхнему регистру (ключ age — заглавные Bech32).
+  K="$(printf '%s' "$RAW" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
   [ -z "$K" ] && { error "Ключ не введён" >&2; return 1; }
+  if [[ "$K" != AGE-SECRET-KEY-1* ]]; then
+    error "Это не похоже на age-ключ (должен начинаться с AGE-SECRET-KEY-1)" >&2; return 1
+  fi
   AGE_KEY_TMP=$(mktemp); printf '%s\n' "$K" > "$AGE_KEY_TMP"; chmod 600 "$AGE_KEY_TMP"
   echo "$AGE_KEY_TMP"; return 0
 }
@@ -1527,7 +1533,8 @@ do_verify_restore() {
   if [ "$ENCRYPTED" = true ]; then
     KEYFILE=$(obtain_age_key) || { error "Нет ключа — проверка зашифрованного бэкапа невозможна" >&2; return 1; }
   fi
-  local TMP; TMP=$(mktemp -d) A GOTDUMP=""
+  local A GOTDUMP="" TMP
+  TMP=$(mktemp -d)
   for A in "$BD"/bot-*.tar.zst*; do
     [ -e "$A" ] || continue
     if [ "$ENCRYPTED" = true ]; then
