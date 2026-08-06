@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.12"
+VERSION="3.0.13"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -953,9 +953,9 @@ else
   echo -e "\033[0m"
   log "🚀 Запуск"; info "Сервер: ${BACKUP_USER:-?}@${BACKUP_SERVER:-НЕ УКАЗАН}" >&2; info "Бот: $BOT_DIR" >&2; info "Кабинет: $CABINET_DIR" >&2; info "Caddy: ${CADDY_DIR:-нет}" >&2
 
-  echo "" >&2; echo "Действие:" >&2; echo "1) 🔒 Только бэкап" >&2; echo "2) 🔄 Только обновление" >&2; echo "3) ⚡ Бэкап + Обновление" >&2; echo "4) ⚙️ Настройки" >&2; echo "5) 🔁 Восстановление из бэкапа" >&2
-  read -p "Выбор [1-5]: " ACT >&2
-  [[ ! "$ACT" =~ ^[1-5]$ ]] && { error "Неверно" >&2; exit 1; }
+  echo "" >&2; echo "Действие:" >&2; echo "1) 🔒 Только бэкап" >&2; echo "2) 🔄 Только обновление" >&2; echo "3) ⚡ Бэкап + Обновление" >&2; echo "4) ⚙️ Настройки" >&2; echo "5) 🔁 Восстановление из бэкапа" >&2; echo "6) 🔎 Тест восстановления (проверка бэкапа, ничего не меняет)" >&2
+  read -p "Выбор [1-6]: " ACT >&2
+  [[ ! "$ACT" =~ ^[1-6]$ ]] && { error "Неверно" >&2; exit 1; }
   [ "$ACT" = "4" ] && { do_settings; exit 0; }
 
   # Выбор компонентов для бэкапа (если не задан --only)
@@ -1557,7 +1557,9 @@ do_verify_restore() {
   fi
 
   # --- Уровень 2: восстановление в ОДНОРАЗОВЫЙ контейнер (боевую БД не трогаем) ---
-  if [ -n "$GOTDUMP" ]; then
+  if [ -n "$GOTDUMP" ] && [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Уровень 2 пропущен: тест-контейнер PostgreSQL не поднимается" >&2
+  elif [ -n "$GOTDUMP" ]; then
     info "Уровень 2: pg_restore в изолированный тест-контейнер..." >&2
     local CN="bedolaga_restoretest_$$"
     docker rm -f "$CN" >/dev/null 2>&1 || true
@@ -1773,10 +1775,13 @@ case $ACT in
      fi
      ;;
   5) do_restore || GLOBAL_EXIT=1 ;;
+  6) do_verify_restore || GLOBAL_EXIT=1 ;;
 esac
 
-# Гарантированное уведомление о сбое (закрывает «тихие» провалы бэкапа)
-if [ "$GLOBAL_EXIT" -ne 0 ]; then notify_failure "$GLOBAL_EXIT" "действие $ACT"; fi
+# Гарантированное уведомление о сбое (закрывает «тихие» провалы бэкапа).
+# Пункт 6 (тест восстановления) исключён: do_verify_restore шлёт свой отчёт сам,
+# иначе в Telegram придут два сообщения об одном и том же.
+if [ "$GLOBAL_EXIT" -ne 0 ] && [ "$ACT" != "6" ]; then notify_failure "$GLOBAL_EXIT" "действие $ACT"; fi
 
 # Результат операции уже зафиксирован в GLOBAL_EXIT и, при сбое, отправлен.
 # Снимаем ERR-trap: дальше идёт только диагностика/отчёт, чьи ненулевые коды
