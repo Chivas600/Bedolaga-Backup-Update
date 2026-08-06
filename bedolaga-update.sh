@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.11"
+VERSION="3.0.12"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1507,10 +1507,10 @@ fetch_remote_backup() {
   info "Скачивание $NAME..." >&2
   if [ "$SRC" = ssh ]; then
     scp -i "$SSH_KEY" -P "$BACKUP_SSH_PORT" -r -o StrictHostKeyChecking=no "${BACKUP_USER}@${BACKUP_SERVER}:${BACKUP_REMOTE_DIR}/${NAME}" "$FETCHED_TMP/" >&2 \
-      || { error "scp: не удалось скачать" >&2; return 1; }
+      || { error "scp: не удалось скачать" >&2; rm -rf "$FETCHED_TMP"; FETCHED_TMP=""; return 1; }
   else
     rclone copy "${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/${NAME}" "$FETCHED_TMP/${NAME}" >&2 \
-      || { error "rclone: не удалось скачать" >&2; return 1; }
+      || { error "rclone: не удалось скачать" >&2; rm -rf "$FETCHED_TMP"; FETCHED_TMP=""; return 1; }
   fi
   success "Скачано во временную папку ✅" >&2
   echo "$FETCHED_TMP/$NAME"
@@ -1586,6 +1586,18 @@ do_verify_restore() {
   return $RC
 }
 
+# ===== ОЧИСТКА ВРЕМЕННЫХ АРТЕФАКТОВ ВОССТАНОВЛЕНИЯ =====
+# Вызывается при ЛЮБОМ выходе из do_restore (в т.ч. при отмене пользователем),
+# иначе скачанный с SSH/S3 бэкап остаётся лежать в /tmp.
+# Локальные переменные do_restore видны здесь благодаря динамической области видимости bash.
+restore_cleanup() {
+  [ -n "${SRC_TMP:-}" ] && rm -rf "$SRC_TMP"
+  [ -n "${AGE_KEY_TMP:-}" ] && rm -f "$AGE_KEY_TMP"
+  [ -n "${FETCHED_TMP:-}" ] && { rm -rf "$FETCHED_TMP"; info "Временная копия бэкапа удалена" >&2; }
+  SRC_TMP=""; AGE_KEY_TMP=""; FETCHED_TMP=""
+  return 0
+}
+
 # ===== ВОССТАНОВЛЕНИЕ =====
 do_restore() {
   header "🔁 ВОССТАНОВЛЕНИЕ ИЗ БЭКАПА" >&2
@@ -1630,13 +1642,13 @@ do_restore() {
 
   echo "" >&2
   read -p "⚠️  Восстановление ПЕРЕЗАПИШЕТ текущие данные. Продолжить? [y/N]: " C1 >&2
-  _yes "$C1" || { info "Отменено" >&2; return 0; }
+  _yes "$C1" || { info "Отменено" >&2; restore_cleanup; return 0; }
 
   read -p "⚠️  Папки бота и кабинета будут перезаписаны. Вы уверены? [y/N]: " C2 >&2
-  _yes "$C2" || { info "Отменено" >&2; return 0; }
+  _yes "$C2" || { info "Отменено" >&2; restore_cleanup; return 0; }
 
   read -p "⚠️  ПОСЛЕДНИЙ ШАНС. Введите слово RESTORE для подтверждения: " C3 >&2
-  [ "$(trim_input "$C3")" = "RESTORE" ] || { info "Отменено" >&2; return 0; }
+  [ "$(trim_input "$C3")" = "RESTORE" ] || { info "Отменено" >&2; restore_cleanup; return 0; }
 
   log "🔁 Начало восстановления из $(basename "$BD")"
 
@@ -1652,12 +1664,12 @@ do_restore() {
       else
         error "SHA256: контрольные суммы НЕ совпали — архив повреждён ❌" >&2
         read -p "Всё равно продолжить восстановление? [y/N]: " CX >&2
-        _yes "$CX" || { info "Отменено" >&2; return 1; }
+        _yes "$CX" || { info "Отменено" >&2; restore_cleanup; return 1; }
       fi
     fi
     local KEYFILE=""
     if [ "$ENCRYPTED" = true ]; then
-      KEYFILE=$(obtain_age_key) || { error "Без приватного age-ключа зашифрованный бэкап восстановить нельзя." >&2; return 1; }
+      KEYFILE=$(obtain_age_key) || { error "Без приватного age-ключа зашифрованный бэкап восстановить нельзя." >&2; restore_cleanup; return 1; }
     fi
     SRC_TMP=$(mktemp -d "/tmp/bedolaga-restore-XXXXXX"); SRC="$SRC_TMP"
     local A
@@ -1666,10 +1678,10 @@ do_restore() {
       info "Распаковка $(basename "$A")..." >&2
       if [ "$ENCRYPTED" = true ]; then
         age -d -i "$KEYFILE" "$A" 2>/dev/null | zstd -dc | tar -x -C "$SRC" \
-          || { error "Ошибка расшифровки/распаковки $(basename "$A") ❌ (неверный ключ?)" >&2; rm -rf "$SRC_TMP"; [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"; return 1; }
+          || { error "Ошибка расшифровки/распаковки $(basename "$A") ❌ (неверный ключ?)" >&2; restore_cleanup; return 1; }
       else
         zstd -dc "$A" | tar -x -C "$SRC" \
-          || { error "Ошибка распаковки $(basename "$A") ❌" >&2; rm -rf "$SRC_TMP"; return 1; }
+          || { error "Ошибка распаковки $(basename "$A") ❌" >&2; restore_cleanup; return 1; }
       fi
     done
     success "Архивы распакованы ✅" >&2
@@ -1725,9 +1737,7 @@ do_restore() {
 Восстановление из бэкапа <b>${DT_LABEL}</b> выполнено.
 Проверьте контейнеры и работоспособность сервисов."
 
-  [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
-  [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"
-  [ -n "$FETCHED_TMP" ] && rm -rf "$FETCHED_TMP"
+  restore_cleanup
   log "✅ Восстановление завершено"
 }
 
