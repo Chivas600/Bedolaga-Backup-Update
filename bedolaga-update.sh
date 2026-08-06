@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.13"
+VERSION="3.0.14"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1516,13 +1516,54 @@ fetch_remote_backup() {
   echo "$FETCHED_TMP/$NAME"
 }
 
-# ===== SELF-TEST ВОССТАНОВЛЕНИЯ (--verify-restore) =====
+# ===== ВЫБОР ЛОКАЛЬНОГО БЭКАПА ИЗ СПИСКА =====
+# Печатает путь к выбранному каталогу бэкапа (или пусто при отмене/ошибке).
+select_local_backup() {
+  local BASE="/root/bedolaga-local-backups" BACKUPS=() i SZ DT SEL
+  while IFS= read -r d; do BACKUPS+=("$d"); done < <(find "$BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort)
+  [ ${#BACKUPS[@]} -eq 0 ] && { error "Локальных бэкапов не найдено в $BASE" >&2; return 1; }
+  info "Локальные бэкапы:" >&2
+  for i in "${!BACKUPS[@]}"; do
+    SZ=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | awk '{print $1}')
+    DT=$(basename "${BACKUPS[$i]}" | sed 's/bedolaga-full-backup-//')
+    echo "  $((i+1))) $DT  ($SZ)" >&2
+  done
+  read -p "Выбор [1-${#BACKUPS[@]}]: " SEL >&2
+  SEL="$(trim_input "$SEL")"
+  { [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le ${#BACKUPS[@]} ]; } \
+    || { error "Неверный выбор" >&2; return 1; }
+  echo "${BACKUPS[$((SEL-1))]}"
+}
+
+# ===== SELF-TEST ВОССТАНОВЛЕНИЯ (--verify-restore / меню 6) =====
 do_verify_restore() {
   header "🔎 ПРОВЕРКА ВОССТАНОВЛЕНИЯ (self-test, без стенда)" >&2
   local BASE="/root/bedolaga-local-backups" BD RC=0
-  BD=$(find "$BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort | tail -1)
-  [ -z "$BD" ] && { error "Нет локальных бэкапов для проверки" >&2; return 1; }
-  info "Проверяем последний бэкап: $(basename "$BD")" >&2
+
+  # Выбор проверяемого бэкапа. В неинтерактивном режиме (cron, пайп) — молча
+  # берём последний локальный, чтобы запуск по расписанию не завис на вопросе.
+  if [ -t 0 ] && [ "$CRON_MODE" != true ]; then
+    echo "" >&2; echo "Какой бэкап проверяем?" >&2
+    echo "  1) Последний локальный (по умолчанию)" >&2
+    echo "  2) Выбрать локальный из списка" >&2
+    echo "  3) Выбрать на SSH-сервере" >&2
+    echo "  4) Выбрать в S3" >&2
+    local VSEL; read -p "Выбор [1-4, по умолчанию 1]: " VSEL >&2
+    case "$(trim_input "$VSEL")" in
+      2) BD=$(select_local_backup)   || return 1 ;;
+      3) BD=$(fetch_remote_backup ssh) || return 1 ;;
+      4) BD=$(fetch_remote_backup s3)  || return 1 ;;
+      *) BD=$(find "$BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort | tail -1) ;;
+    esac
+  else
+    BD=$(find "$BASE" -maxdepth 1 -type d -name "bedolaga-full-backup-*" | sort | tail -1)
+  fi
+  [ -z "$BD" ] && { error "Нет бэкапов для проверки" >&2; return 1; }
+
+  info "Проверяем бэкап: $(basename "$BD")" >&2
+  if [ -f "$BD/manifest.txt" ]; then
+    info "Манифест: $(grep -E '^(scope|encrypted|components):' "$BD/manifest.txt" | tr '\n' ' ' | sed 's/  */ /g')" >&2
+  fi
 
   # --- Уровень 1: целостность файлов ---
   if [ -f "$BD/SHA256SUMS" ]; then
@@ -1580,10 +1621,12 @@ do_verify_restore() {
     fi
   fi
 
-  rm -rf "$TMP"; [ -n "$AGE_KEY_TMP" ] && rm -f "$AGE_KEY_TMP"
+  local BD_LABEL; BD_LABEL="$(basename "$BD")"
+  rm -rf "$TMP"
+  restore_cleanup   # чистит age-ключ и скачанную с SSH/S3 временную копию
   if [ "$RC" -eq 0 ]; then success "✅ Проверка восстановления ПРОЙДЕНА" >&2; else error "❌ Проверка выявила проблемы" >&2; fi
   send_telegram "🔎 <b>Bedolaga verify-restore</b> — $(date '+%Y-%m-%d %H:%M')
-Бэкап: $(basename "$BD")
+Бэкап: ${BD_LABEL}
 Итог: $([ "$RC" -eq 0 ] && echo '✅ OK' || echo '❌ проблемы — см. лог')"
   return $RC
 }
