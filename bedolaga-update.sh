@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.14"
+VERSION="3.0.15"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -39,11 +39,41 @@ guard() {
 }
 
 # ===== НОРМАЛИЗАЦИЯ ВВОДА =====
-# Убирает пробелы и управляющие символы (в т.ч. \r от CRLF-клиентов SSH),
-# из-за которых ответы вида "y" не совпадали с ^[Yy]$.
-trim_input() { printf '%s' "$1" | tr -d '[:space:]'; }
+# Во время долгих операций в буфер терминала попадает «мусор»: escape-коды
+# фокуса вкладки (\e[O / \e[I — клиент шлёт их при переключении вкладок),
+# стрелки (\e[A), \r от CRLF-клиентов, случайные Enter. Всё это склеивается с
+# ответом пользователя, и "y" превращается в $'\e[O\e[Iy' → не совпадает с ^[Yy]$.
+# trim_input срезает escape-последовательности, управляющие символы и пробелы.
+trim_input() {
+  printf '%s' "$1" \
+    | LC_ALL=C sed -E 's/\x1b\[[0-9;?]*[@-~]//g; s/\x1bO.//g; s/\x1b.//g' \
+    | LC_ALL=C tr -d '[:space:][:cntrl:]'
+}
 # _yes ОТВЕТ -> 0, если это y/yes (без учёта регистра и мусора)
 _yes() { [[ "$(trim_input "$1")" =~ ^[Yy]([Ee][Ss])?$ ]]; }
+# flush_input: выбросить всё, что накопилось в буфере терминала до вопроса
+# (случайный Enter во время бэкапа иначе засчитывается как ответ «нет»).
+flush_input() {
+  [ -t 0 ] || return 0
+  local _junk
+  while read -r -s -t 0.05 -n 256 _junk 2>/dev/null; do :; done
+  return 0
+}
+# confirm "Вопрос? [y/N]: " -> 0 = да, 1 = нет. Чистит буфер перед вопросом,
+# на непонятный ответ переспрашивает (до 3 раз) и пишет сырой ввод в отчёт.
+confirm() {
+  local PROMPT="$1" ANS CLEAN TRY
+  for TRY in 1 2 3; do
+    flush_input
+    read -r -p "$PROMPT" ANS >&2 || return 1
+    CLEAN="$(trim_input "$ANS")"
+    [[ "$CLEAN" =~ ^[Yy]([Ee][Ss])?$ ]] && return 0
+    [[ -z "$CLEAN" || "$CLEAN" =~ ^[Nn]([Oo])?$ ]] && return 1
+    warn "Не понял ответ: $(printf '%q' "$ANS"). Введите y или n." >&2
+    declare -F log >/dev/null && log "⚠️ Непонятный ответ на «${PROMPT%%[*}»: $(printf '%q' "$ANS")"
+  done
+  return 1
+}
 # trim_ws: срезает только ведущие/замыкающие пробелы и \r (внутренние сохраняет)
 trim_ws() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
@@ -113,8 +143,7 @@ prompt_path() {
 
   if [ -n "$FOUND" ]; then
     info "Найден путь к $LABEL: $FOUND" >&2
-    read -p "✅ Использовать? [y/N]: " CONFIRM >&2
-    if _yes "$CONFIRM"; then PROMPT_PATH_RESULT="$FOUND"; return 0; fi
+    if confirm "✅ Использовать? [y/N]: "; then PROMPT_PATH_RESULT="$FOUND"; return 0; fi
   fi
 
   local CANDIDATES=()
@@ -220,8 +249,7 @@ detect_paths() {
   if component_available caddy; then
     if [ -n "$FOUND_CADDY" ]; then
       info "Найден путь к Caddy: $FOUND_CADDY" >&2
-      read -p "✅ Использовать? [y/N]: " CC >&2
-      _yes "$CC" && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
+      confirm "✅ Использовать? [y/N]: " && CADDY_DIR="$FOUND_CADDY" || { info "Введите путь или Enter для пропуска" >&2; read -p "📁 Путь к Caddy: " CADDY_DIR >&2; }
     else
       info "Caddy не найден. Введите путь или Enter для пропуска" >&2
       read -p "📁 Путь к Caddy: " CADDY_DIR >&2
@@ -335,7 +363,7 @@ rotate_remote_backups() {
   info "Подключение к серверу для ротации..." >&2
 
   local RET=${BACKUP_RETENTION:-7}
-  local SSH="ssh -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
+  local SSH="ssh -n -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
 
   local ALL=$($SSH "ls -1d ${BACKUP_REMOTE_DIR}/bedolaga-full-backup-* 2>/dev/null | sort" || true)
   [ -z "$ALL" ] && { info "На удалённом сервере нет бэкапов ✅" >&2; return 0; }
@@ -569,10 +597,12 @@ obtain_age_key() {
   warn "Нужен приватный age-ключ — на сервере он не хранится." >&2
   info "Вставьте строку ключа (AGE-SECRET-KEY-1...) и нажмите Enter:" >&2
   local K RAW
+  flush_input
   read -r RAW </dev/tty || read -r RAW
-  # Терминал мог перенести вставленную строку: убираем ВСЕ пробелы/переводы строк,
-  # приводим к верхнему регистру (ключ age — заглавные Bech32).
-  K="$(printf '%s' "$RAW" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  # Терминал мог перенести вставленную строку, а клиент — подмешать escape-коды
+  # фокуса (пользователь уходит на вкладку Telegram за ключом и возвращается):
+  # trim_input срезает их вместе с пробелами/переводами строк; ключ age — заглавные Bech32.
+  K="$(trim_input "$RAW" | tr '[:lower:]' '[:upper:]')"
   [ -z "$K" ] && { error "Ключ не введён" >&2; return 1; }
   if [[ "$K" != AGE-SECRET-KEY-1* ]]; then
     error "Это не похоже на age-ключ (должен начинаться с AGE-SECRET-KEY-1)" >&2; return 1
@@ -594,11 +624,9 @@ TXT
   echo "" >&2
   if [ -n "$AGE_RECIPIENT" ]; then
     warn "Уже настроен публичный ключ: $AGE_RECIPIENT" >&2
-    read -p "Сгенерировать НОВЫЙ ключ? Старые зашифрованные бэкапы станут нечитаемы новым ключом [y/N]: " RG >&2
-    _yes "$RG" || { info "Оставляю текущий ключ" >&2; return 0; }
+    confirm "Сгенерировать НОВЫЙ ключ? Старые зашифрованные бэкапы станут нечитаемы новым ключом [y/N]: " || { info "Оставляю текущий ключ" >&2; return 0; }
   fi
-  read -p "Сгенерировать ключ и включить шифрование? [y/N]: " GO >&2
-  _yes "$GO" || { info "Отмена" >&2; return 0; }
+  confirm "Сгенерировать ключ и включить шифрование? [y/N]: " || { info "Отмена" >&2; return 0; }
 
   # Генерируем в stdout: age-keygen -o отказывается писать в уже существующий файл (mktemp его создаёт)
   local KGEN PUB PRIV
@@ -624,8 +652,7 @@ TXT
   echo "" >&2
 
   if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-    read -p "Прислать ПОЛНЫЙ ключ в Telegram под спойлером (скрыт + самоудаление)? [y/N]: " TS >&2
-    if _yes "$TS"; then
+    if confirm "Прислать ПОЛНЫЙ ключ в Telegram под спойлером (скрыт + самоудаление)? [y/N]: "; then
       if tg_send_selfdestruct "🔐 <b>Bedolaga — приватный age-ключ бэкапов</b>
 
 ⚠️ <b>СОХРАНИТЕ</b> этот ключ (менеджер паролей). Без него зашифрованные бэкапы не восстановить.
@@ -649,7 +676,8 @@ TXT
   local TAIL="${PRIV: -8}" OK=false TRY CONF
   echo "" >&2
   for TRY in 1 2 3; do
-    read -p "Подтвердите сохранение: введите ПОСЛЕДНИЕ 8 символов приватного ключа: " CONF >&2
+    flush_input
+    read -r -p "Подтвердите сохранение: введите ПОСЛЕДНИЕ 8 символов приватного ключа: " CONF >&2
     CONF="$(trim_input "$CONF")"
     if [ "$CONF" = "$TAIL" ]; then OK=true; break; fi
     warn "Не совпало (попытка $TRY/3). Точно сохранили ключ?" >&2
@@ -664,8 +692,7 @@ TXT
   echo "" >&2
   warn "Хранение приватного ключа на СЕРВЕРЕ упрощает восстановление, но при взломе" >&2
   warn "сервера злоумышленник сможет расшифровать бэкапы. Рекомендация: НЕ хранить." >&2
-  read -p "Сохранить приватный ключ на сервере (для авто-восстановления здесь же)? [y/N]: " KEEP >&2
-  if _yes "$KEEP"; then
+  if confirm "Сохранить приватный ключ на сервере (для авто-восстановления здесь же)? [y/N]: "; then
     AGE_KEY_FILE="/root/.bedolaga-age.key"; printf '%s\n' "$KGEN" > "$AGE_KEY_FILE"; chmod 600 "$AGE_KEY_FILE"
     warn "Ключ сохранён в $AGE_KEY_FILE (chmod 600). Всё равно держите копию у себя!" >&2
   else
@@ -754,8 +781,7 @@ if [ "$NEED_FULL_SETUP" = true ]; then
   read -p "💬 Telegram Chat ID (Enter для пропуска): " TG_CHAT_ID >&2
   read -p "🧵 Telegram Topic ID (Enter для пропуска): " TG_THREAD_ID >&2
   echo "" >&2
-  read -p "💾 Сохранить ВСЕ настройки? [y/N]: " SAVE_ALL >&2
-  if _yes "$SAVE_ALL"; then save_all_config; fi
+  if confirm "💾 Сохранить ВСЕ настройки? [y/N]: "; then save_all_config; fi
 fi
 
 REPORT_FILE="/root/bedolaga-report-$(date +%Y%m%d-%H%M).txt"
@@ -1491,7 +1517,7 @@ fetch_remote_backup() {
   local SRC="$1" NAMES=() NAME
   if [ "$SRC" = ssh ]; then
     [ -z "$BACKUP_SERVER" ] && { error "SSH-сервер не настроен" >&2; return 1; }
-    local SSH="ssh -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
+    local SSH="ssh -n -i $SSH_KEY -p $BACKUP_SSH_PORT -o StrictHostKeyChecking=no ${BACKUP_USER}@${BACKUP_SERVER}"
     mapfile -t NAMES < <($SSH "ls -1d ${BACKUP_REMOTE_DIR}/bedolaga-full-backup-* 2>/dev/null" 2>/dev/null | while read -r p; do basename "$p"; done | sort)
   else
     { [ -z "$RCLONE_REMOTE" ] || [ -z "$S3_BUCKET" ]; } && { error "S3 не настроен" >&2; return 1; }
@@ -1686,13 +1712,12 @@ do_restore() {
   info "Выбран: $(basename "$BD")" >&2
 
   echo "" >&2
-  read -p "⚠️  Восстановление ПЕРЕЗАПИШЕТ текущие данные. Продолжить? [y/N]: " C1 >&2
-  _yes "$C1" || { info "Отменено" >&2; restore_cleanup; return 0; }
+  confirm "⚠️  Восстановление ПЕРЕЗАПИШЕТ текущие данные. Продолжить? [y/N]: " || { info "Отменено" >&2; restore_cleanup; return 0; }
 
-  read -p "⚠️  Папки бота и кабинета будут перезаписаны. Вы уверены? [y/N]: " C2 >&2
-  _yes "$C2" || { info "Отменено" >&2; restore_cleanup; return 0; }
+  confirm "⚠️  Папки бота и кабинета будут перезаписаны. Вы уверены? [y/N]: " || { info "Отменено" >&2; restore_cleanup; return 0; }
 
-  read -p "⚠️  ПОСЛЕДНИЙ ШАНС. Введите слово RESTORE для подтверждения: " C3 >&2
+  flush_input
+  read -r -p "⚠️  ПОСЛЕДНИЙ ШАНС. Введите слово RESTORE для подтверждения: " C3 >&2
   [ "$(trim_input "$C3")" = "RESTORE" ] || { info "Отменено" >&2; restore_cleanup; return 0; }
 
   log "🔁 Начало восстановления из $(basename "$BD")"
@@ -1708,8 +1733,7 @@ do_restore() {
         success "SHA256: контрольные суммы совпали ✅" >&2
       else
         error "SHA256: контрольные суммы НЕ совпали — архив повреждён ❌" >&2
-        read -p "Всё равно продолжить восстановление? [y/N]: " CX >&2
-        _yes "$CX" || { info "Отменено" >&2; restore_cleanup; return 1; }
+        confirm "Всё равно продолжить восстановление? [y/N]: " || { info "Отменено" >&2; restore_cleanup; return 1; }
       fi
     fi
     local KEYFILE=""
@@ -1813,8 +1837,8 @@ case $ACT in
   2) do_update || GLOBAL_EXIT=1 ;;
   3) do_backup || GLOBAL_EXIT=1
      if [ $GLOBAL_EXIT -eq 0 ]; then
-       echo "" >&2; read -p "✅ Бэкап готов. Обновить? [y/N]: " C >&2
-       if _yes "$C"; then do_update || GLOBAL_EXIT=1; else info "Обновление отменено" >&2; fi
+       echo "" >&2
+       if confirm "✅ Бэкап готов. Обновить? [y/N]: "; then do_update || GLOBAL_EXIT=1; else info "Обновление отменено" >&2; fi
      fi
      ;;
   5) do_restore || GLOBAL_EXIT=1 ;;
