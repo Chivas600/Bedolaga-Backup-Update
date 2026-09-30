@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.16"
+VERSION="3.0.17"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1338,7 +1338,26 @@ do_update() {
   restore_custom_files "$BOT_DIR" "bot"
   apply_injections "$BOT_DIR"
   docker compose down
-  if ! docker compose up -d --build bot; then error "Бот: пересборка контейнера упала ❌" >&2; log "❌ Бот: docker compose up --build не удался"; UPDATE_RC=1; fi
+  if ! docker compose up -d --build bot; then
+    # Мажорное обновление PostgreSQL (бот 5.0.0: 15 → 18): compose уже на новой версии,
+    # а данные в старом томе — сторож в контейнере базы не даёт ей стартовать и просит
+    # перенос. Запускаем штатный скрипт бота: дамп → restore в новый том → сверка → запуск.
+    # Старый том он не трогает (это откат), дамп кладёт в backups/postgres-upgrade-*.
+    if [ -f scripts/pg-upgrade.sh ] && docker compose logs --tail=60 postgres 2>&1 | grep -q 'pg-upgrade'; then
+      warn "Бот: база на старой версии PostgreSQL — запускаю перенос (scripts/pg-upgrade.sh) 🐘" >&2
+      log "🐘 Бот: база на старой версии PostgreSQL — запуск scripts/pg-upgrade.sh"
+      if bash scripts/pg-upgrade.sh --yes >&2; then
+        success "Бот: база перенесена на новую версию PostgreSQL ✅" >&2
+        log "✅ Бот: база перенесена (старый том и дамп в $BOT_DIR/backups/postgres-upgrade-* сохранены)"
+      else
+        error "Бот: перенос базы PostgreSQL не удался ❌ — данные в старом томе целы. Вручную: cd $BOT_DIR && bash scripts/pg-upgrade.sh" >&2
+        log "❌ Бот: перенос базы PostgreSQL не удался (вручную: cd $BOT_DIR && bash scripts/pg-upgrade.sh)"
+        UPDATE_RC=1
+      fi
+    else
+      error "Бот: пересборка контейнера упала ❌" >&2; log "❌ Бот: docker compose up --build не удался"; UPDATE_RC=1
+    fi
+  fi
   sleep 10
   if docker compose ps | grep -q "remnawave_bot.*(healthy)"; then success "Бот: healthy ✅" >&2; log "✅ Бот обновлён (healthy)"; else warn "Бот: не healthy после обновления ⚠️" >&2; log "⚠️ Бот: health-проверка не прошла"; docker compose logs --tail=20 bot||true; UPDATE_RC=1; fi
   else
