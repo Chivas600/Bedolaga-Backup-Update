@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.17"
+VERSION="3.0.18"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1484,16 +1484,37 @@ http_probe() {
 do_check() {
   header "✅ ПРОВЕРКА" >&2
   info "Контейнеры:" >&2
-  local DOCKER_OUT=$(docker ps --format '{{.Names}}\t{{.Status}}' | grep -E "remnawave|cabinet" || true)
+  # -a: упавшие контейнеры (Restarting/Created/Exited) в обычном `docker ps` не видны
+  # или не помечены (unhealthy) — раньше при них печаталось «работают штатно».
+  local DOCKER_OUT=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E "remnawave|cabinet" || true)
   echo "$DOCKER_OUT" | tee -a "$REPORT_FILE" >&2
+  local CONTAINERS_OK=true BAD MISSING="" C
+  BAD=$(echo "$DOCKER_OUT" | awk -F'\t' 'NF && ($2 !~ /^Up / || $2 ~ /\(Paused\)/) { printf "%s%s (%s)", sep, $1, $2; sep=", " }')
+  # Ключевые контейнеры могут отсутствовать совсем (после `docker compose down` и неудачного up)
+  for C in remnawave_bot cabinet_frontend; do
+    case "$C" in
+      remnawave_bot)    component_available bot     || continue ;;
+      cabinet_frontend) component_available cabinet || continue ;;
+    esac
+    echo "$DOCKER_OUT" | grep -q "^${C}"$'\t' || MISSING="${MISSING:+$MISSING, }$C"
+  done
+  if [ -n "$BAD" ]; then
+    error "Контейнеры не работают: $BAD ❌" >&2; log "❌ Контейнеры не работают: $BAD"
+    CONTAINERS_OK=false; HEALTH_WARN=1
+  fi
+  if [ -n "$MISSING" ]; then
+    error "Контейнеры не найдены: $MISSING ❌" >&2; log "❌ Контейнеры не найдены: $MISSING"
+    CONTAINERS_OK=false; HEALTH_WARN=1
+  fi
   if echo "$DOCKER_OUT" | grep -q "(unhealthy)"; then
     if [ -n "$PRIMARY_DOMAIN" ] && curl -s -o /dev/null -w "%{http_code}" "https://$PRIMARY_DOMAIN" | grep -q "200"; then
       warn "Контейнер помечен (unhealthy), но сайт отвечает ✅ (проверьте healthcheck в docker-compose.yml)" >&2
     else
       warn "Есть контейнеры в статусе (unhealthy)" >&2
     fi
-    HEALTH_WARN=1
-  else
+    CONTAINERS_OK=false; HEALTH_WARN=1
+  fi
+  if [ "$CONTAINERS_OK" = true ]; then
     success "Все контейнеры работают штатно 🟢" >&2
   fi
   if [ -n "$PRIMARY_DOMAIN" ]; then
@@ -1524,7 +1545,7 @@ show_report() {
   header "📊 ОТЧЁТ" >&2; echo "Время: $(date '+%Y-%m-%d %H:%M:%S')"; echo "Файл: $REPORT_FILE"; echo ""; cat "$REPORT_FILE"; echo ""
   if [ "$CODE" -eq 0 ]; then
     success "🎉 Операции выполнены успешно!" >&2
-    [ $HEALTH_WARN -eq 1 ] && warn "⚠️ Обратите внимание: есть контейнеры в статусе (unhealthy)" >&2
+    [ $HEALTH_WARN -eq 1 ] && warn "⚠️ Обратите внимание: блок ПРОВЕРКА нашёл проблемы (контейнеры или SMTP) — см. выше" >&2
   else
     error "❌ Операция завершилась с ошибками" >&2
   fi
