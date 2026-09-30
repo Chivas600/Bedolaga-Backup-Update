@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
 done
 SSH_KEY="/root/.ssh/id_backup"
 HEALTH_WARN=0
-VERSION="3.0.15"
+VERSION="3.0.16"
 
 # ===== DRY-RUN =====
 # guard <команда...>: в режиме --dry-run печатает намерение и НЕ выполняет команду.
@@ -1630,7 +1630,11 @@ do_verify_restore() {
     info "Уровень 2: pg_restore в изолированный тест-контейнер..." >&2
     local CN="bedolaga_restoretest_$$"
     docker rm -f "$CN" >/dev/null 2>&1 || true
-    if docker run -d --name "$CN" -e POSTGRES_PASSWORD=verifytest -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" postgres:15-alpine >/dev/null 2>&1; then
+    # Образ — тот же, что у боевой базы: дамп новой версии PostgreSQL не читается старой
+    # (pg_restore: unsupported version in file header), а старый дамп в новую встаёт.
+    local TEST_IMG; TEST_IMG=$(docker inspect -f '{{.Config.Image}}' "$PG_CONTAINER" 2>/dev/null || true)
+    TEST_IMG="${TEST_IMG:-postgres:18-alpine}"
+    if docker run -d --name "$CN" -e POSTGRES_PASSWORD=verifytest -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" "$TEST_IMG" >/dev/null 2>&1; then
       local i; for i in $(seq 1 30); do docker exec "$CN" pg_isready -U "$PG_USER" >/dev/null 2>&1 && break; sleep 1; done
       # pg_restore выдаёт варнинги (роли/расширения) и код !=0 даже при успехе —
       # критерий успеха: в public появились таблицы, а не exit-код.
